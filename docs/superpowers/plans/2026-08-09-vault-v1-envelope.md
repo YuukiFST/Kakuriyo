@@ -289,7 +289,7 @@ pub fn installHostCalls(app_state: *App, io: std.Io, allocator: std.mem.Allocato
 
 - [ ] **Step 1: Spike the std plumbing** (compile a 20-line scratch under `nix-shell -p zig` first): exact spellings for `std.testing` Io in tests, `std.testing.tmpDir(.{})` usage, `Io.Dir.openDirAbsolute` (or `cwd()`) + `createFileAtomic` + `file.sync(io)` + `Atomic.replace(io)`, `argon2.kdf` allocator argument, `XChaCha20Poly1305.encrypt/decrypt` argument order (from `std/crypto/chacha20.zig` lines 735/749), `std.crypto.secureZero(u8, &buf)` coercions. Write the found spellings into this task's steps (replace anything that drifts).
 
-- [ ] **Step 2: Write the oracle tests inside `vault.zig` first** (they must not compile / must fail). From research/03 + spec only — no implementation in view:
+- [x] **Step 2: Write the oracle tests inside `vault.zig` first** (they must not compile / must fail). From research/03 + spec only — no implementation in view:
 
   - `test "create writes v1 file and unlocks"` — temp path; `create(pw, defaultParams())`; read the file (via the temp dir's `dir` handle + `readFileAlloc`): magic `KAKU`, `version == 1`, m/t/p == owasp baseline, salt 16, nonces 24, wrapped_dek 48, total length == `header_len + tag_len` (empty payload); `session.unlocked`.
   - `test "roundtrip across payload sizes"` — sizes `{ 0, 1, 16, 255, 1024, 65536 }` with deterministic byte patterns; create → save → lock → unlock → payload identical; also unlock immediatley after create returns the empty payload.
@@ -307,11 +307,11 @@ pub fn installHostCalls(app_state: *App, io: std.Io, allocator: std.mem.Allocato
   - `test "consecutive kdf params are persisted"` — create with non-default params `{ 8192, 1, 2 }` → file header matches; unlock works.
   - Property sweep (stdlib loop, fixed seed): for 40 random payloads (sizes via `std.Random.DefaultPrng` seeded constant), round-trip holds; note: keys/nonces come from the CSPRNG; patterns are deterministic.
 
-- [ ] **Step 3: Run the oracles — expected FAIL/compile errors**
+- [x] **Step 3: Run the oracles — expected FAIL/compile errors**
 
 `nix-shell --run "zig test src/vault/vault.zig"` → fails with `error: root source file ... has no member named 'Session'` (or similar). Record the failures as the baseline.
 
-- [ ] **Step 4: Implement `vault.zig`**
+- [x] **Step 4: Implement `vault.zig`**
 
 `Session` per the API above. Notes for the implementer:
 - `create`: `io.random` (CSPRNG) for salt/nonces/DEK; `argon2.kdf(allocator, &kek, password, salt, params, .argon2id)`; wrap DEK with the DEK nonce; `secureZero(kek)` immediately after; encrypt empty payload; atomic write; store DEK + payload; `unlocked = true`.
@@ -321,11 +321,11 @@ pub fn installHostCalls(app_state: *App, io: std.Io, allocator: std.mem.Allocato
 - Atomic write: parent dir handle (`openDirAbsolute` on the dirname), `createFileAtomic(parent, io, basename, .{ .replace = true })`, `file.writeAll(io, ...)`, `file.sync(io)`, `atomic.replace(io)`, then best-effort dir fsync if the Io exposes it; on any failure, `atomic.deinit(io)` removes the temp.
 - `lock`: `secureZero(u8, &self.dek)`, payload: `secureZero` then free; every error path that produced a KEK/password copy zeroes before returning.
 
-- [ ] **Step 5: Green**
+- [x] **Step 5: Green**
 
 `nix-shell --run "zig test src/vault/vault.zig"` — all oracles pass. `zig fmt src/vault/`.
 
-- [ ] **Step 6: Register the fast gate**
+- [x] **Step 6: Register the fast gate**
 
 Append to `build.zig`:
 
@@ -337,7 +337,7 @@ Append to `build.zig`:
 
 with `src/vault/tests.zig` = `comptime { _ = @import("vault.zig"); _ = @import("vault_host.zig"); }` (vault_host arrives in Task 3 — write the import then; for Task 2 only `vault.zig`). Verify `nix-shell --run "zig build test-vault"` runs the suite. Also verify the app still builds: `nix-shell --run "native build"` (the wiring's staged `vault.zig` import exists from Task 1 — keep a minimal `Session = struct{}` stub in `vault.zig` ONLY if Task 2 lands before Task 1's adapter is adapted; otherwise merge cleanly).
 
-- [ ] **Step 7: Mutation gate (first 8 mutants) — installed and seen failing**
+- [x] **Step 7: Mutation gate (first 8 mutants) — installed and seen failing**
 
 Create `tools/gates/mutate.sh`: a loop over mutant descriptors `name|target_file|sed_expression|test_command` where each iteration applies sed → runs the named test command → expects non-zero → reverts via `git checkout -- <file>` (or `cp` backup). Non-zero everywhere except the mutant's own pass-through. Mutants (vault.zig, run `zig build test-vault`):
 
@@ -354,7 +354,7 @@ M8 no_version_bind|use AAD without the version                               -> 
 
 Disposition rule: any mutant whose expected tests pass = survivor → script exits 1 and names it. For a scripted `sed` that cannot express a mutant reliably, apply the patch with a heredoc `perl -0pi`; if a mutant cannot be mechanically applied, annotate it in the ledger as equivalent/skipped with the reason (never silently).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/vault build.zig tools/gates && git-safe-commit "feat: close vault v1 envelope (argon2id KEK + XChaCha20-Poly1305 + atomic save)"
