@@ -1,6 +1,8 @@
 .DS_Store
-target/
-dist/
 *.log
 .env
 .env.*
+.native/
+zig-out/
+.zig-cache/
+node_modules/

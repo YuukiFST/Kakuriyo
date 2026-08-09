@@ -1,0 +1,12 @@
+.{
+    .name = .kakuriyo,
+    .fingerprint = 0x33a3923d41c5655e,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .native_sdk = .{ .path = "vendor/native-sdk" } },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon", "README.md", "build", "vendor", "tests", "tools" },
+    // Absolute SDK path: the CLI's scaffold emits a path relative to the
+    // app dir, which silently breaks when the app lives on another mount
+    // (/mnt/Others vs /home here). The CLI installs into node's global
+    // root, so the absolute form is the only portable one on this box.
+}

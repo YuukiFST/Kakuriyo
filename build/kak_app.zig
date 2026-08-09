@@ -1,0 +1,1487 @@
+//! Kakuriyo's app build helper — VENDORED from @native-sdk/cli 0.8.3
+//! (commit 30c1410) `build/app.zig`, Apache-2.0. The Native SDK's public
+//! build surface (native_sdk.addApp/addAppArtifacts) leaves no hook for
+//! app-owned Zig wiring of a TypeScript core, so the app owns this copy
+//! and keeps the SDK's own behavior byte-identical.
+//!
+//! Patches vs upstream (re-vendor with `diff -u <cli>/build/app.zig build/kak_app.zig`):
+//!   P1  ownership header (this comment)
+//!   P2  web_layer_contract import -> kak_web_layer.zig (sibling vendored file)
+//!   P3  tsCoreStage stages the APP's src/app_runner/ts_core_main.zig as
+//!       main.zig instead of the SDK copy, and stages src/vault/*.zig
+//!       beside it so the app-owned wiring can @import them.
+
+const std = @import("std");
+
+/// The shared web-layer inference contract: this build graph is one thin
+/// adapter over it (the CLI's manifest tooling and the app runner are the
+/// others), feeding it the inputs only this boundary sees — the
+/// `-Dweb-engine` and `-Dweb-layer` flags resolved against app.zon.
+const web_layer_contract = @import("kak_web_layer.zig");
+
+const PlatformOption = enum {
+    auto,
+    null,
+    macos,
+    linux,
+    windows,
+};
+
+const TraceOption = enum {
+    off,
+    events,
+    runtime,
+    all,
+};
+
+const WebEngineOption = web_layer_contract.WebEngine;
+
+const WebLayerOption = web_layer_contract.WebViewLayer;
+
+pub const AppOptions = struct {
+    name: []const u8,
+    /// App entry point; defaults to src/main.zig (relative to `app_root`).
+    main: []const u8 = "src/main.zig",
+    /// Root of the app source tree, relative to the build root. "." for a
+    /// build.zig that lives in the app directory (every ejected app). The
+    /// CLI's generated build graph under `<app>/.native/build/` passes
+    /// "../.." so `src/`, `app.zon`, and `assets/` keep resolving in the
+    /// app directory rather than the cache directory.
+    app_root: []const u8 = ".",
+    /// Live `<terminal>` sessions: set true AND pin ghostty as a LAZY
+    /// dependency in the app's OWN build.zig.zon (the examples/workbench
+    /// pin) — the framework then resolves `ghostty-vt` with the app
+    /// module's target/optimize and the safe flags (simd off, no macOS
+    /// app or xcframework artifacts), and the runtime owns the emulator
+    /// behind every `<terminal pty={key}>` binding. Default false wires
+    /// the stub: `<terminal>` renders the honest empty surface, and the
+    /// build never traverses ghostty's dependency graph (whose configure
+    /// step walks wuffs/translate_c and whose full build pulls harfbuzz)
+    /// — the load-bearing property for scaffolded apps.
+    terminal_sessions: bool = false,
+};
+
+/// Which core the app tree carries. No flag and no config anywhere: the
+/// tree IS the truth — `src/core.ts` is a TypeScript core (compiled to
+/// native code at build time, run through generated wiring),
+/// `src/main.zig` a Zig one, and both at once is a teaching error
+/// naming the two files.
+const CoreTree = enum { zig, ts, both, neither };
+
+fn detectCoreTree(b: *std.Build, app_root: []const u8) CoreTree {
+    const has_ts = appFileExists(b, app_root, "src/core.ts");
+    const has_zig = appFileExists(b, app_root, "src/main.zig");
+    if (has_ts and has_zig) return .both;
+    if (has_ts) return .ts;
+    if (has_zig) return .zig;
+    return .neither;
+}
+
+fn appFileExists(b: *std.Build, app_root: []const u8, sub_path: []const u8) bool {
+    b.build_root.handle.access(b.graph.io, appPath(b, app_root, sub_path), .{}) catch return false;
+    return true;
+}
+
+/// How a TypeScript core compiles: through the external core compiler,
+/// always. The frontend checks the core and emits its contract sidecar,
+/// corewire projects the compile entry and profile, the exact-pinned
+/// external toolchain builds the archive, and the app links corewire's
+/// generated mirror over it. `.core_compiler` in app.zon (and the
+/// `-Dcore-compiler` flag) accept only "external" — the value exists so
+/// a stated choice stays stateable; the removed transpiled lane's
+/// spelling is refused with a teaching (see resolveCoreCompiler).
+const core_compiler_teaching =
+    "\ncore_compiler = \"transpiler\" names the removed TS-to-Zig transpiled lane (v0.7.0" ++
+    " removed it): a TypeScript core compiles through the external core compiler now, and" ++
+    " that is the default.\nDelete the setting (or spell it \"external\").\n";
+
+/// The staged TypeScript-core wiring: one generated directory holding the
+/// core module (the generated mirror with its staged shim runtime), the
+/// app's markup, and the SDK's generated-wiring entry (ts_core_main.zig
+/// as main.zig) — plus the compiled-core archive the app module links
+/// behind the mirror. Built once per app build and shared by the exe
+/// and test modules.
+const TsCoreStage = struct {
+    main_root: std.Build.LazyPath,
+    /// The compiled-core archive: the app module links it (with libc,
+    /// for the toolchain's runtime) beside the staged mirror.
+    archive: std.Build.LazyPath,
+};
+
+/// The frontend's own sources — the staleness set of every build step
+/// that runs it (a frontend edit re-checks every core).
+const frontend_sources = [_][]const u8{
+    "checker.ts", "cli.ts", "contract.ts", "diagnostics.ts", "frontend.ts", "infer.ts", "modules.ts", "ownership.ts", "typed_ast.ts", "types.ts", "wyhash.ts",
+};
+
+/// Whether the frontend's TypeScript compiler (@typescript/old, the
+/// exactly pinned npm alias of the real `typescript` package) RESOLVES
+/// from the SDK's packages/core, by node's ancestor node_modules walk —
+/// at the SDK's exactly pinned VERSION. The same semantics the CLI gates
+/// on (src/tooling/ts_core.zig
+/// transpilerResolution, this predicate's deliberate twin: keep the two
+/// in lockstep).
+///
+/// Validation tracks ONLY what runtime loads, from the same origin
+/// runtime resolves from: typed_ast.ts imports "@typescript/old" directly
+/// and build/ts_run.mjs's load hook requires it from the target
+/// packages/core/src module — src/ never carries a node_modules, so
+/// packages/core is the walk origin that mirrors both. Covers every
+/// layout: a repo checkout's packages/core/node_modules (nearest wins),
+/// and the npm-installed CLI whose own `dependencies` carry the alias
+/// (nested under the package on global prefixes, hoisted to the project
+/// root on local ones, pnpm's sibling node_modules).
+///
+/// A stray `@typescript/typescript6` compat wrapper in a consumer tree
+/// (a former dependency of this package, or the consumer's own) is
+/// deliberately NOT probed: nothing imports it at run time, and holding
+/// the alias's version as seen FROM a wrapper's origin against the pin
+/// can only FALSE-REJECT healthy trees — a consumer's hoisted conflicting
+/// `@typescript/old` wins the walk from there while the copy runtime
+/// actually loads sits correctly pinned under packages/core.
+///
+/// Resolvable means the alias's manifest AND its entrypoint are present
+/// (see tsAliasedCompilerVersion for node's error shape and the
+/// mid-extraction slivers) and its installed version equals the pin —
+/// read from the SDK dependency's own packages/core/package.json (the
+/// `npm:typescript@X.Y.Z` alias suffix in devDependencies —
+/// tsParseAliasedCompilerPin, mirroring the twin's
+/// parseAliasedCompilerPin), never hardcoded, so version bumps stay a
+/// one-file change.
+const TsToolchainResolution = union(enum) {
+    resolved,
+    unresolved,
+    /// The aliased compiler resolves, but at a version other than the
+    /// SDK's exact pin (strings allocated on b.allocator, freed never —
+    /// this is configure-time teaching data).
+    version_mismatch: struct { resolved: []const u8, pinned: []const u8 },
+};
+
+fn tsToolchainResolution(b: *std.Build, dep: *std.Build.Dependency) TsToolchainResolution {
+    const sdk_root = tsSdkRoot(b.allocator, b.graph.io, dep);
+    // The pin first: an SDK tree whose packages/core/package.json is
+    // missing or pinless is not one this gate can vouch for (the file
+    // ships in every layout), so it concludes unresolved and the teaching
+    // path acts.
+    const pinned = tsPinnedCompilerVersion(b, sdk_root) orelse return .unresolved;
+    const resolved = tsAliasedCompilerVersion(b, b.pathJoin(&.{ sdk_root, "packages", "core" })) orelse return .unresolved;
+    if (std.mem.eql(u8, resolved, pinned)) return .resolved;
+    return .{ .version_mismatch = .{ .resolved = resolved, .pinned = pinned } };
+}
+
+/// How runtime's `import "@typescript/old"` resolves, by node's walk FROM
+/// `origin_dir` upward: the nearest ancestor
+/// `node_modules/@typescript/old` wins (skipping ancestors that are
+/// themselves a node_modules directory, as node does). Callers pass the
+/// SDK's packages/core — the origin typed_ast.ts and ts_run.mjs resolve
+/// the alias from. The walk must be a real ancestor walk, not a
+/// fixed-sibling probe: npm hoists the alias to the install root on flat
+/// layouts and nests it under the CLI on version conflicts. Resolvable
+/// means the alias's manifest AND its entrypoint — the alias is the real
+/// `typescript` package, whose `"main"` is ./lib/typescript.js (no
+/// `"exports"`): a bare directory (an interrupted install, a pruned
+/// node_modules) is MODULE_NOT_FOUND at run time, and a manifest without
+/// its entrypoint (npm extraction is not atomic; package.json rides
+/// first in the tarball) fails just as opaquely. Hardcoding it is safe
+/// because the alias is exactly pinned (`npm:typescript@X.Y.Z` in both
+/// manifests plus the lockfile) and drift-checked by check-version-sync.
+/// A manifest without its entrypoint THROWS in node rather than
+/// consulting a deeper ancestor, so it concludes unresolvable here too
+/// (this predicate's deliberate twin: src/tooling/ts_core.zig's
+/// aliasedCompilerVersion — keep the two in lockstep).
+///
+/// Returns the resolved alias's installed VERSION so the caller can hold
+/// it against the SDK's pin; a resolvable-looking alias whose manifest
+/// carries no version field returns null (every real npm install writes
+/// one — its absence is a corrupt sliver, not a compiler to vouch for).
+fn tsAliasedCompilerVersion(b: *std.Build, origin_dir: []const u8) ?[]const u8 {
+    const io = b.graph.io;
+    var dir: []const u8 = origin_dir;
+    while (true) {
+        if (!std.mem.eql(u8, std.fs.path.basename(dir), "node_modules")) {
+            found: {
+                const manifest_path = b.pathJoin(&.{ dir, "node_modules", "@typescript", "old", "package.json" });
+                std.Io.Dir.cwd().access(io, manifest_path, .{}) catch break :found;
+                std.Io.Dir.cwd().access(io, b.pathJoin(&.{ dir, "node_modules", "@typescript", "old", "lib", "typescript.js" }), .{}) catch return null;
+                const manifest = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, b.allocator, .limited(64 * 1024)) catch return null;
+                return tsParseQuotedManifestValue(manifest, "\"version\"", "");
+            }
+        }
+        dir = std.fs.path.dirname(dir) orelse return null;
+    }
+}
+
+/// The version the SDK pins its aliased compiler to, read from the SDK
+/// dependency's own packages/core/package.json — the same manifest the
+/// CLI's gate reads, so both surfaces learn a version bump from one file.
+fn tsPinnedCompilerVersion(b: *std.Build, sdk_root: []const u8) ?[]const u8 {
+    const manifest = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathJoin(&.{ sdk_root, "packages", "core", "package.json" }), b.allocator, .limited(64 * 1024)) catch return null;
+    const pin = tsParseQuotedManifestValue(manifest, "\"@typescript/old\"", "npm:typescript@") orelse return null;
+    // Exact X.Y.Z only (check-version-sync's pin shape), mirroring the
+    // twin's parseAliasedCompilerPin: a range is not a pin.
+    if (pin.len == 0) return null;
+    for (pin) |c| {
+        if (!std.ascii.isDigit(c) and c != '.') return null;
+    }
+    if (std.mem.count(u8, pin, ".") != 2) return null;
+    return pin;
+}
+
+/// Targeted scan for a manifest key's string value (the twin of
+/// ts_core.zig's parsePackageVersion/parseAliasedCompilerPin scanners):
+/// find `key`, expect `: "<required_prefix><value>"`, return `value`.
+fn tsParseQuotedManifestValue(manifest_json: []const u8, comptime key: []const u8, comptime required_prefix: []const u8) ?[]const u8 {
+    const key_at = std.mem.indexOf(u8, manifest_json, key) orelse return null;
+    var rest = manifest_json[key_at + key.len ..];
+    rest = std.mem.trimStart(u8, rest, " \t\r\n");
+    if (rest.len == 0 or rest[0] != ':') return null;
+    rest = std.mem.trimStart(u8, rest[1..], " \t\r\n");
+    if (rest.len == 0 or rest[0] != '"') return null;
+    rest = rest[1..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    const value = rest[0..end];
+    if (!std.mem.startsWith(u8, value, required_prefix)) return null;
+    const suffix = value[required_prefix.len..];
+    if (suffix.len == 0) return null;
+    return suffix;
+}
+
+/// The external core compiler's entry module (scriptc's dist/main.js),
+/// resolved by node's ancestor node_modules walk from the SDK's
+/// packages/core — the same origin the frontend toolchain resolves from
+/// (tsAliasedCompilerVersion's walk, kept in lockstep). Repo checkouts
+/// install it there with `npm ci`; the npm-installed CLI carries the
+/// compiler as a regular dependency, nested under the package on global
+/// prefixes and hoisted to the project root on local ones.
+fn tsExternalCompilerJs(b: *std.Build, dep: *std.Build.Dependency) ?[]const u8 {
+    const io = b.graph.io;
+    const sdk_root = tsSdkRoot(b.allocator, io, dep);
+    var dir: []const u8 = b.pathJoin(&.{ sdk_root, "packages", "core" });
+    while (true) {
+        if (!std.mem.eql(u8, std.fs.path.basename(dir), "node_modules")) {
+            const candidate = b.pathJoin(&.{ dir, "node_modules", "scriptc", "dist", "main.js" });
+            found: {
+                std.Io.Dir.cwd().access(io, candidate, .{}) catch break :found;
+                return candidate;
+            }
+        }
+        dir = std.fs.path.dirname(dir) orelse return null;
+    }
+}
+
+/// The SDK dependency's real root, resolved the way both the toolchain
+/// check and its teaching name it.
+fn tsSdkRoot(allocator: std.mem.Allocator, io: std.Io, dep: *std.Build.Dependency) []const u8 {
+    const raw_root = dep.builder.build_root.path orelse ".";
+    return std.Io.Dir.cwd().realPathFileAlloc(io, raw_root, allocator) catch raw_root;
+}
+
+/// The TS-core preflight — the markup view, node, and the frontend
+/// toolchain gate — returning the resolved node program. The frontend
+/// (the subset checker and the contract-sidecar emitter) runs under
+/// node; the compile itself is the external toolchain's.
+fn tsCorePreflight(b: *std.Build, dep: *std.Build.Dependency, app_root: []const u8) []const u8 {
+    if (!appFileExists(b, app_root, "src/app.native")) {
+        @panic("\nthis app has a TypeScript core (src/core.ts) but no view: TS apps render markup," ++
+            " so add src/app.native (the whole view tier binds the core's model)\n");
+    }
+    const node = b.findProgram(&.{"node"}, &.{}) catch {
+        @panic("\nbuilding a TypeScript app core needs node on PATH (the @native-sdk/core frontend checks the" ++
+            " core at build time; the binary you ship carries no JS runtime).\nInstall Node.js 22.15+ (on the 23" ++
+            " line: 23.5+) — https://nodejs.org or `brew install node` — and re-run.\n");
+    };
+    switch (tsToolchainResolution(b, dep)) {
+        .resolved => {},
+        .unresolved => {
+            // Safety net for direct `zig build` users: the `native` CLI
+            // gates this itself, so reaching here means zig was invoked by
+            // hand against an SDK whose toolchain resolves nowhere. Name
+            // the SDK dependency's real location as a RESOLVED path and
+            // fail the configure phase cleanly — a teaching message, never
+            // a panic stack trace.
+            const sdk_root = tsSdkRoot(dep.builder.allocator, dep.builder.graph.io, dep);
+            std.debug.print(
+                \\
+                \\error: the @native-sdk/core frontend cannot resolve its TypeScript toolchain
+                \\(its compiler, @typescript/old). On a repo checkout, install it once with:
+                \\  cd {s}/packages/core && npm ci --include=dev
+                \\(An npm-installed @native-sdk/cli carries the toolchain automatically; if it
+                \\is missing there, the install is broken - reinstall @native-sdk/cli.)
+                \\
+                \\
+            , .{sdk_root});
+            std.process.exit(1);
+        },
+        .version_mismatch => |mismatch| {
+            // The wrong-VERSION shape gets its own teaching (the CLI's
+            // gate mirrors it): a conflicting consumer-tree
+            // @typescript/old shadows the SDK's exact pin, and no install
+            // command fixes what is already installed — the conflict has
+            // to move.
+            std.debug.print(
+                \\
+                \\error: the @native-sdk/core frontend's TypeScript compiler resolves at the
+                \\wrong version: @typescript/old resolves to typescript {s}, but the SDK pins
+                \\npm:typescript@{s}. Another package in this tree pins a conflicting
+                \\@typescript/old - align it with the SDK's pin (or remove it) and reinstall,
+                \\so the SDK's exact pin is the copy that resolves.
+                \\
+                \\
+            , .{ mismatch.resolved, mismatch.pinned });
+            std.process.exit(1);
+        },
+    }
+    return node;
+}
+
+/// The TypeScript-core compile lane: the frontend checks the core and
+/// emits its contract sidecar, corewire projects the generated compile
+/// entry and library-mode profile, the stager assembles the compile
+/// tree (author sources with the mechanical staging transforms, the
+/// staged SDK modules, the static compile surface), the exact-pinned
+/// external toolchain builds the archive AND co-emits the archive's own
+/// contract sidecar, and corewire generates the mirror module from THAT
+/// document — so the boot identity fence always pairs the mirror with
+/// its own compile. The staged module directory carries core.zig (the
+/// mirror) + its staged runtime + app.native + main.zig, so the
+/// generated wiring imports one fixed shape.
+fn tsCoreStage(b: *std.Build, dep: *std.Build.Dependency, app_root: []const u8, app_name: []const u8) TsCoreStage {
+    const node = tsCorePreflight(b, dep, app_root);
+
+    // The frontend, in check-only mode: the subset checker and the
+    // contract sidecar, no emission. Every check-time teaching gates the
+    // compile here — the checker's NS diagnostics stream to stderr
+    // verbatim; nothing wraps them. The frontend runs through
+    // build/ts_run.mjs, not as `node cli.ts`: on the npm-installed
+    // layout the frontend's .ts sources live inside node_modules, where
+    // node refuses its builtin type stripping — the runner strips those
+    // modules with the frontend's own installed TypeScript and is a
+    // pass-through on a repo checkout. The frontend reads its own
+    // sources, the SDK modules, and the core's WHOLE import graph at
+    // run time; declare them all so an edit to ANY module of a
+    // multi-file core re-checks it (every .ts under src/ is a superset
+    // of the reachable imports: over-approximation only re-runs the
+    // check, never misses a stale input).
+    const check = b.addSystemCommand(&.{node});
+    check.addFileArg(dep.path("build/ts_run.mjs"));
+    check.addFileArg(dep.path("packages/core/src/cli.ts"));
+    check.addFileArg(b.path(appPath(b, app_root, "src/core.ts")));
+    check.addArg("--contract");
+    const contract = check.addOutputFileArg("core.contract.json");
+    // The document's entry spelling is app-relative (the sidecar/facade
+    // contract carries no machine paths).
+    check.addArgs(&.{ "--contract-entry", "src/core.ts" });
+    addTsDirInputs(b, dep.builder, check, "packages/core/sdk");
+    addAppTsDirInputs(b, check, appPath(b, app_root, "src"));
+    for (frontend_sources) |source| {
+        check.addFileInput(dep.path(b.fmt("packages/core/src/{s}", .{source})));
+    }
+
+    // corewire, compiled from the SDK dependency for the build host: one
+    // invocation projects the generated compile entry and its profile,
+    // so the profile's entry spelling and the facade file can never skew.
+    const corewire_exe = corewireExe(b, dep);
+    const project = b.addRunArtifact(corewire_exe);
+    project.addArg("--sidecar");
+    project.addFileArg(contract);
+    project.addArg("--facade");
+    const facade = project.addOutputFileArg("core_facade.ts");
+    project.addArg("--profile");
+    const profile = project.addOutputFileArg("core_profile.json");
+
+    // The compile stage: author sources + staged SDK + static surface +
+    // generated entry/profile, one scratch tree.
+    const stage_run = b.addSystemCommand(&.{node});
+    stage_run.addFileArg(dep.path("packages/core/scripts/stage_external_core.mjs"));
+    stage_run.addArg("--src");
+    stage_run.addDirectoryArg(b.path(appPath(b, app_root, "src")));
+    stage_run.addArg("--sdk");
+    stage_run.addDirectoryArg(dep.path("packages/core/sdk"));
+    stage_run.addArg("--static");
+    stage_run.addFileArg(dep.path("packages/core/compile-surface/core.ts"));
+    stage_run.addArg("--facade");
+    stage_run.addFileArg(facade);
+    stage_run.addArg("--profile");
+    stage_run.addFileArg(profile);
+    stage_run.addArg("--out");
+    const stage_dir = stage_run.addOutputDirectoryArg("stage");
+
+    // The external compile itself: driver-verified against the SDK's
+    // exact pin, archive normalized, the co-emitted sidecar captured.
+    const symbol_name = externalCoreSymbolName(b, app_name);
+    const compile = b.addSystemCommand(&.{node});
+    compile.addFileArg(dep.path("packages/core/scripts/run_external_core_compiler.mjs"));
+    compile.addArg("--stage");
+    compile.addDirectoryArg(stage_dir);
+    compile.addArgs(&.{ "--name", symbol_name });
+    compile.addArg("--manifest");
+    compile.addFileArg(dep.path("packages/core/package.json"));
+    compile.addArg("--out-archive");
+    const archive = compile.addOutputFileArg(b.fmt("lib{s}.a", .{symbol_name}));
+    compile.addArg("--out-sidecar");
+    const compiled_sidecar = compile.addOutputFileArg("core.contract.json");
+    if (b.graph.environ_map.get("NATIVE_SDK_CORE_COMPILER")) |override| {
+        // The development override: point at any toolchain command; the
+        // driver still refuses a release other than the SDK's pin.
+        compile.addArgs(&.{ "--compiler", override });
+    } else {
+        const compiler_js = tsExternalCompilerJs(b, dep) orelse {
+            const sdk_root = tsSdkRoot(dep.builder.allocator, dep.builder.graph.io, dep);
+            std.debug.print(
+                \\
+                \\error: the external core compiler is not installed (TypeScript cores compile
+                \\through it). It ships as an exact-pinned dependency of the SDK's packages/core
+                \\— install it once with:
+                \\  cd {s}/packages/core && npm ci
+                \\(or point NATIVE_SDK_CORE_COMPILER at the pinned release's command; an
+                \\npm-installed @native-sdk/cli carries the compiler automatically — if it is
+                \\missing there, the install is broken: reinstall @native-sdk/cli).
+                \\
+                \\
+            , .{sdk_root});
+            std.process.exit(1);
+        };
+        compile.addArg("--compiler-js");
+        compile.addFileArg(.{ .cwd_relative = compiler_js });
+    }
+
+    // The mirror, generated from the archive's OWN co-emitted contract.
+    const mirror = b.addRunArtifact(corewire_exe);
+    mirror.addArg("--sidecar");
+    mirror.addFileArg(compiled_sidecar);
+    mirror.addArg("--out");
+    const shim = mirror.addOutputFileArg("core_shim.zig");
+
+    // The staged module directory: the mirror is the app's core.zig,
+    // and it imports its staged shim runtime relatively.
+    const staged = b.addWriteFiles();
+    _ = staged.addCopyFile(shim, "core.zig");
+    _ = staged.addCopyFile(dep.path("tools/corewire/shim_rt.zig"), "shim_rt.zig");
+    _ = staged.addCopyFile(dep.path("tools/corewire/core_abi.zig"), "core_abi.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app.native")), "app.native");
+    // P3: stage the app-owned wiring and the vault host module instead of
+    // the SDK's generated-wiring copy.
+    const main_root = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/ts_core_main.zig")), "main.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/vault/vault.zig")), "vault.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/vault/vault_host.zig")), "vault_host.zig");
+    // P3: the wiring's test seam imports this beside the mirror.
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/host_roundtrip_tests.zig")), "host_roundtrip_tests.zig");
+    return .{ .main_root = main_root, .archive = archive };
+}
+
+/// corewire (the contract-sidecar shim generator), compiled from the SDK
+/// dependency's sources for the build host.
+fn corewireExe(b: *std.Build, dep: *std.Build.Dependency) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .root_source_file = dep.path("tools/corewire/main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    return b.addExecutable(.{
+        .name = "corewire",
+        .root_module = mod,
+        .use_llvm = useLlvmWorkaround(b.graph.host),
+    });
+}
+
+/// The archive's symbol-safe stem (`<app>_core` with every non-identifier
+/// byte folded to '_'), the -o name the external compile builds under.
+fn externalCoreSymbolName(b: *std.Build, app_name: []const u8) []const u8 {
+    const stem = b.fmt("{s}_core", .{app_name});
+    const sanitized = b.dupe(stem);
+    for (sanitized) |*char| {
+        const ok = (char.* >= 'a' and char.* <= 'z') or (char.* >= 'A' and char.* <= 'Z') or
+            (char.* >= '0' and char.* <= '9') or char.* == '_';
+        if (!ok) char.* = '_';
+    }
+    return sanitized;
+}
+
+/// Declare every .ts file in an SDK-relative directory as a file input of
+/// the transpile step (the SDK library modules an app may import).
+fn addTsDirInputs(b: *std.Build, sdk_builder: *std.Build, transpile: *std.Build.Step.Run, dir_path: []const u8) void {
+    var dir = sdk_builder.build_root.handle.openDir(b.graph.io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(b.graph.io);
+    var it = dir.iterate();
+    while (it.next(b.graph.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".ts")) continue;
+        transpile.addFileInput(sdk_builder.path(b.fmt("{s}/{s}", .{ dir_path, entry.name })));
+    }
+}
+
+/// Declare every .ts file under the app's src/ (recursively — a core may
+/// split into subdirectories) as a file input of the transpile step.
+fn addAppTsDirInputs(b: *std.Build, transpile: *std.Build.Step.Run, src_path: []const u8) void {
+    var dir = b.build_root.handle.openDir(b.graph.io, src_path, .{ .iterate = true }) catch return;
+    defer dir.close(b.graph.io);
+    var walker = dir.walk(b.allocator) catch return;
+    defer walker.deinit();
+    while (walker.next(b.graph.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".ts")) continue;
+        transpile.addFileInput(b.path(b.fmt("{s}/{s}", .{ src_path, entry.path })));
+    }
+}
+
+/// The `native_sdk_app_*` C ABI every embed static library exports.
+pub const mobile_export_symbol_names = [_][]const u8{
+    "native_sdk_app_create",
+    "native_sdk_app_destroy",
+    "native_sdk_app_start",
+    "native_sdk_app_activate",
+    "native_sdk_app_deactivate",
+    "native_sdk_app_stop",
+    "native_sdk_app_resize",
+    "native_sdk_app_viewport",
+    "native_sdk_app_viewport_state",
+    "native_sdk_app_gpu_frame_state",
+    "native_sdk_app_text_input_state",
+    "native_sdk_app_set_text_measure",
+    "native_sdk_app_set_audio_service",
+    "native_sdk_app_audio_event",
+    "native_sdk_app_set_image_service",
+    "native_sdk_app_set_automation_dir",
+    "native_sdk_app_touch",
+    "native_sdk_app_scroll",
+    "native_sdk_app_key",
+    "native_sdk_app_text",
+    "native_sdk_app_ime",
+    "native_sdk_app_command",
+    "native_sdk_app_frame",
+    "native_sdk_app_chrome_tab_count",
+    "native_sdk_app_chrome_tab_at",
+    "native_sdk_app_chrome_primary_action",
+    "native_sdk_app_chrome_selected_tab",
+    "native_sdk_app_chrome_navigation_depth",
+    "native_sdk_app_chrome_navigation_back_command",
+    "native_sdk_app_chrome_icon_pixels",
+    "native_sdk_app_set_form_factor",
+    "native_sdk_app_set_chrome_tabs_projected",
+    "native_sdk_app_set_asset_root",
+    "native_sdk_app_set_asset_entry",
+    "native_sdk_app_last_command_count",
+    "native_sdk_app_last_command_name",
+    "native_sdk_app_last_error_name",
+    "native_sdk_app_widget_semantics_count",
+    "native_sdk_app_widget_semantics_at",
+    "native_sdk_app_widget_semantics_by_id",
+    "native_sdk_app_widget_text_geometry",
+    "native_sdk_app_widget_action",
+    "native_sdk_app_render_pixel_size",
+    "native_sdk_app_render_pixels",
+    "native_sdk_app_render_pixels_damage",
+};
+
+pub const MobileSceneOption = enum {
+    /// The user app's UiApp on a gpu_surface view (window 1,
+    /// "mobile-surface"), pumped by the host's frame callback.
+    canvas,
+    /// The fixed WebView shell the ios/android/mobile-shell examples embed
+    /// today; the app module is not compiled in.
+    webview,
+};
+
+pub const MobileLibOptions = struct {
+    name: []const u8,
+    /// Mobile app entry (the `"app"` module the embed host drives); must
+    /// declare `Model`, `Msg`, `initModel`, and `mobileOptions` — see
+    /// `src/embed/ui_host.zig`. Ignored for `.scene = .webview`.
+    main: []const u8 = "src/main.zig",
+    scene: MobileSceneOption = .canvas,
+};
+
+/// Mobile counterpart of `addApp`: produce the embed static library
+/// (`native_sdk_app_*` C ABI) compiled with the user's UiApp. Call it from
+/// a standalone build.zig (it registers the standard `target`/`optimize`
+/// options itself).
+pub fn addMobileLib(b: *std.Build, dep: *std.Build.Dependency, options: MobileLibOptions) void {
+    const target = nativeSdkTarget(b);
+    const optimize_request = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size");
+    const optimize = exampleOptimizeMode(b, optimize_request, .Debug);
+    addMobileLibWithTarget(b, dep, target, optimize, options);
+}
+
+/// The mobile-lib wiring behind `addMobileLib`, for builds that already
+/// resolved `target`/`optimize` (`addAppArtifacts` registers the `lib`
+/// step through this for iOS/Android targets, so every standard app —
+/// generated graph or ejected `addApp` — can produce the embed library
+/// with nothing but `-Dtarget`).
+fn addMobileLibWithTarget(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: MobileLibOptions) void {
+    const native_sdk_mod = nativeSdkModule(b, dep, target, optimize);
+    // Android hosts load the embed lib inside a shared object
+    // (System.loadLibrary / NativeActivity), so every object must be PIC —
+    // without it Zig emits local-exec TLS relocations (R_AARCH64_TLSLE_*)
+    // that the NDK linker rejects when producing the shim .so. Imported
+    // modules leave `pic` null and inherit this from the root module.
+    const pic: ?bool = if (target.result.abi.isAndroid()) true else null;
+    const exports_mod = b.createModule(.{
+        .root_source_file = dep.path(switch (options.scene) {
+            .canvas => "src/embed/app_exports.zig",
+            .webview => "src/embed/c_exports.zig",
+        }),
+        .target = target,
+        .optimize = optimize,
+        .pic = pic,
+    });
+    exports_mod.addImport("native_sdk", native_sdk_mod);
+    if (options.scene == .canvas) {
+        const app_mod = localModule(b, target, optimize, options.main);
+        app_mod.addImport("native_sdk", native_sdk_mod);
+        exports_mod.addImport("app", app_mod);
+    }
+    exports_mod.export_symbol_names = &mobile_export_symbol_names;
+
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = options.name,
+        .root_module = exports_mod,
+        // The embed C ABI (`native_sdk_app_viewport`) is exactly the
+        // f32-heavy SysV signature Zig 0.16.0's self-hosted x86_64 backend
+        // miscompiles (see useLlvmWorkaround in the framework build.zig):
+        // clang-compiled hosts calling a self-hosted Debug lib receive
+        // corrupted inset/keyboard floats on x86_64 (Android emulators,
+        // Intel simulators). Force LLVM there; Release already uses it.
+        .use_llvm = useLlvmWorkaround(target),
+    });
+    b.installArtifact(lib);
+
+    const lib_step = b.step("lib", "Build the mobile embed static library");
+    lib_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+}
+
+/// The pieces `addApp` wires, for callers that extend the standard app
+/// build (extra native sources, frameworks, post-build steps such as
+/// entitlement signing). `install` is the artifact-install step behind the
+/// default `zig build`; append dependencies to it and to `run` to order
+/// work between the emitted binary and its consumers.
+pub const AppArtifacts = struct {
+    exe: *std.Build.Step.Compile,
+    tests: *std.Build.Step.Compile,
+    install: *std.Build.Step.InstallArtifact,
+    run: *std.Build.Step.Run,
+};
+
+pub fn addApp(b: *std.Build, dep: *std.Build.Dependency, app_options: AppOptions) void {
+    _ = addAppArtifacts(b, dep, app_options);
+}
+
+pub fn addAppArtifacts(b: *std.Build, dep: *std.Build.Dependency, app_options: AppOptions) AppArtifacts {
+    const target = nativeSdkTarget(b);
+    const optimize_request = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size");
+    const optimize = exampleOptimizeMode(b, optimize_request, .Debug);
+    const app_optimize = exampleOptimizeMode(b, optimize_request, .ReleaseFast);
+
+    // The core role is detected from the tree (never a flag or config):
+    // builds with a custom `main` entry declared their core explicitly and
+    // skip detection.
+    const core_tree: CoreTree = if (std.mem.eql(u8, app_options.main, "src/main.zig"))
+        detectCoreTree(b, app_options.app_root)
+    else
+        .zig;
+    if (core_tree == .both) {
+        @panic("\nthis app declares two cores: src/core.ts (TypeScript) and src/main.zig (Zig)." ++
+            "\nAn app has exactly one core - the tree is the truth. Keep src/core.ts and delete" ++
+            " src/main.zig,\nor keep src/main.zig and delete src/core.ts. (Other Zig files under" ++
+            " src/ are fine either way.)\n");
+    }
+    const app_config = appManifestBuildConfig(b, app_options.app_root);
+    // The core-compiler setting names the one lane there is; the flag
+    // overrides app.zon's `.core_compiler` and both exist so a stated
+    // choice stays stateable (and so the removed lane's spelling teaches
+    // instead of failing opaquely).
+    if (b.option([]const u8, "core-compiler", "How a TypeScript core compiles: external (the default and only lane)")) |flag| {
+        if (std.mem.eql(u8, flag, "transpiler")) @panic(core_compiler_teaching);
+        if (!std.mem.eql(u8, flag, "external")) @panic("\n-Dcore-compiler must be \"external\" (the default and only lane)\n");
+        if (core_tree != .ts) {
+            @panic("\n-Dcore-compiler applies to TypeScript cores (src/core.ts) only; this app has" ++
+                " a Zig core.\nDrop the flag or port the core to TypeScript.\n");
+        }
+    }
+    // Mobile targets are taught BEFORE lane selection: TypeScript cores
+    // are desktop-only until the external core toolchain grows mobile
+    // targets; Zig/markup cores stay fully supported on mobile.
+    if (core_tree == .ts and (target.result.os.tag == .ios or target.result.abi.isAndroid())) {
+        @panic("\nTypeScript app cores are desktop-only today: the external core compiler does not" ++
+            " target mobile yet.\nBuild for a desktop target, or port the core to a Zig" ++
+            " `mobileOptions` app — Zig and markup cores are fully supported on mobile.\n");
+    }
+    const ts_stage: ?TsCoreStage = if (core_tree == .ts)
+        tsCoreStage(b, dep, app_options.app_root, app_options.name)
+    else
+        null;
+
+    // Mobile targets get the embed static library as a `lib` step: the
+    // artifact the toolkit-owned iOS host (and any hand-written shim)
+    // links, so `native dev|package --target ios` works against every
+    // standard app build — generated graph or ejected — with nothing but
+    // `-Dtarget`. Desktop targets keep the step absent.
+    if (target.result.os.tag == .ios or target.result.abi.isAndroid()) {
+        addMobileLibWithTarget(b, dep, target, optimize, .{
+            .name = app_options.name,
+            .main = appPath(b, app_options.app_root, app_options.main),
+        });
+    }
+    const platform_option = b.option(PlatformOption, "platform", "Desktop backend: auto, null, macos, linux, windows") orelse .auto;
+    const trace_option = b.option(TraceOption, "trace", "Trace output: off, events, runtime, all") orelse .events;
+    const debug_overlay = b.option(bool, "debug-overlay", "Enable debug overlay output") orelse false;
+    const automation_enabled = b.option(bool, "automation", "Enable Native SDK automation artifacts") orelse false;
+    const js_bridge_enabled = b.option(bool, "js-bridge", "Enable optional JavaScript bridge stubs") orelse false;
+    const web_engine_override = b.option(WebEngineOption, "web-engine", "Override app.zon web engine: system, chromium");
+    const web_layer_override = b.option(WebLayerOption, "web-layer", "Override app.zon webview_layer: auto, include, exclude");
+    const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
+    const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
+    const selected_platform: PlatformOption = switch (platform_option) {
+        .auto => if (target.result.os.tag == .macos) .macos else if (target.result.os.tag == .linux) .linux else if (target.result.os.tag == .windows) .windows else .null,
+        else => platform_option,
+    };
+    if (selected_platform == .macos and target.result.os.tag != .macos) {
+        @panic("-Dplatform=macos requires a macOS target");
+    }
+    if (selected_platform == .linux and target.result.os.tag != .linux) {
+        @panic("-Dplatform=linux requires a Linux target");
+    }
+    if (selected_platform == .windows and target.result.os.tag != .windows) {
+        @panic("-Dplatform=windows requires a Windows target");
+    }
+    const web_engine = web_engine_override orelse app_config.web_engine;
+    const cef_dir = cef_dir_override orelse defaultCefDir(selected_platform, app_config.cef_dir);
+    const cef_auto_install = cef_auto_install_override orelse app_config.cef_auto_install;
+    if (web_engine == .chromium and selected_platform != .macos) {
+        @panic("-Dweb-engine=chromium currently requires -Dplatform=macos");
+    }
+    const web_layer = resolveWebLayer(app_config, web_engine, web_layer_override);
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "platform", switch (selected_platform) {
+        .auto => unreachable,
+        .null => "null",
+        .macos => "macos",
+        .linux => "linux",
+        .windows => "windows",
+    });
+    options.addOption([]const u8, "trace", @tagName(trace_option));
+    options.addOption([]const u8, "web_engine", @tagName(web_engine));
+    options.addOption(bool, "debug_overlay", debug_overlay);
+    options.addOption(bool, "automation", automation_enabled);
+    options.addOption(bool, "js_bridge", js_bridge_enabled);
+    options.addOption(bool, "web_layer", web_layer);
+    const options_mod = options.createModule();
+
+    const app_mod = appModule(b, dep, target, app_optimize, app_options, options_mod, ts_stage);
+    const exe = b.addExecutable(.{
+        .name = app_options.name,
+        .root_module = app_mod,
+        // The app executable crosses the platform C seam on every host
+        // call (the GTK host's `native_sdk_gtk_create_view` is a
+        // 22-parameter mix of pointers, sizes, ints, and doubles), and
+        // Zig 0.16.0's self-hosted x86_64 backend miscompiles exactly
+        // that calling-convention shape (see useLlvmWorkaround below):
+        // a Debug `native dev` on x86_64 Linux placed the stack-passed
+        // string arguments one slot off, so the host read a garbage
+        // `role` pointer and crashed in `native_sdk_strndup` while the
+        // register-passed `label` arrived intact. Every other artifact
+        // in this graph already forces LLVM on x86_64; the app exe —
+        // the one binary users actually run — must too.
+        .use_llvm = useLlvmWorkaround(target),
+    });
+    // Windows subsystem posture: release-shaped exes (`native build`,
+    // and therefore everything `native package --target windows` wraps)
+    // are GUI-subsystem, so launching the app never flashes a console
+    // window behind it. Debug exes keep the console subsystem — the dev
+    // loop's logs live there, and a double-clicked Debug binary opening
+    // its own log console is a feature. Redirected logging still works
+    // on GUI exes (handles inherit; only console AUTO-allocation is
+    // gated by the subsystem), so automation harnesses that pipe
+    // `app.exe > log 2>&1` keep their logs either way.
+    if (target.result.os.tag == .windows and app_optimize != .Debug) {
+        exe.subsystem = .windows;
+    }
+    linkPlatform(b, dep, target, app_mod, exe, selected_platform, web_engine, web_layer, cef_dir, cef_auto_install);
+    const install = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install.step);
+
+    const run = b.addRunArtifact(exe);
+    addCefRuntimeRunFiles(b, target, run, exe, web_engine, cef_dir);
+    addWebView2RuntimeRunFiles(dep, target, run, web_engine, web_layer);
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run.step);
+
+    const test_app_mod = if (app_optimize == optimize) app_mod else appModule(b, dep, target, optimize, app_options, options_mod, ts_stage);
+    const tests = b.addTest(.{ .root_module = test_app_mod, .use_llvm = useLlvmWorkaround(target) });
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // `native test` must surface the app's compile-time teaching errors,
+    // not just its test failures. Test builds never analyze `main` (the
+    // test runner replaces the entry point), so rules that fire inside it
+    // — UiApp.create's Model-defaults rule above all — used to ambush at
+    // `native build`, the LAST step in the loop. Compiling this object
+    // forces full semantic analysis of the app module, entry point
+    // included; nothing links or runs.
+    const analysis_root = b.addWriteFiles().add("app_analysis.zig",
+        \\//! Generated by the app build: force semantic analysis of the
+        \\//! app's entry point at test time. Exactly `main`, transitively —
+        \\//! the same surface `native build` analyzes — so test-time can
+        \\//! never be stricter than the build it fronts.
+        \\comptime {
+        \\    const app = @import("app");
+        \\    if (@hasDecl(app, "main")) _ = &app.main;
+        \\}
+        \\
+    );
+    const analysis_mod = b.createModule(.{
+        .root_source_file = analysis_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    analysis_mod.addImport("app", test_app_mod);
+    const analysis_obj = b.addObject(.{
+        .name = b.fmt("{s}-analysis", .{app_options.name}),
+        .root_module = analysis_mod,
+        .use_llvm = useLlvmWorkaround(target),
+    });
+    test_step.dependOn(&analysis_obj.step);
+
+    // `zig build model-contract`: reflect the app's Model/Msg into
+    // zig-out/model-contract.zon so `native check` can verify markup
+    // bindings against the app's real surface without compiling the app.
+    // The artifact carries a hash over the app's Zig sources; the checker
+    // degrades to structural checking when it goes stale. Apps without a
+    // pub Model/Msg pair make this a silent no-op. The test step refreshes
+    // the artifact too, so CI-checked apps always hold a fresh one.
+    const contract_root = b.addWriteFiles().add("model_contract_emit.zig",
+        \\//! Generated by the app build: emits the model contract artifact
+        \\//! (see the toolkit's ui_markup_contract.zig).
+        \\const std = @import("std");
+        \\const native_sdk = @import("native_sdk");
+        \\const app = @import("app");
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    try native_sdk.canvas.emitModelContractMain(app, init);
+        \\}
+        \\
+    );
+    // The emit root must share the app module's native_sdk instance so
+    // the Msg payload types it classifies are the same types the app
+    // declares its variants with.
+    const contract_mod = b.createModule(.{
+        .root_source_file = contract_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    contract_mod.addImport("app", test_app_mod);
+    if (test_app_mod.import_table.get("native_sdk")) |sdk_mod| {
+        contract_mod.addImport("native_sdk", sdk_mod);
+    }
+    const contract_exe = b.addExecutable(.{
+        .name = b.fmt("{s}-model-contract", .{app_options.name}),
+        .root_module = contract_mod,
+        .use_llvm = useLlvmWorkaround(target),
+    });
+    const contract_run = b.addRunArtifact(contract_exe);
+    contract_run.setCwd(b.path(app_options.app_root));
+    contract_run.addArgs(&.{ "--src", "src", "--out", "zig-out/model-contract.zon" });
+    contract_run.has_side_effects = true;
+    const contract_step = b.step("model-contract", "Emit zig-out/model-contract.zon for `native check`");
+    contract_step.dependOn(&contract_run.step);
+    test_step.dependOn(&contract_run.step);
+
+    // `zig build package`: bundle the built binary through the `native`
+    // CLI (built from the native_sdk dependency), so a scaffolded app can
+    // package itself without locating the CLI by hand.
+    const host_os = b.graph.host.result.os.tag;
+    const package_target: ?[]const u8 = switch (host_os) {
+        .macos => "macos",
+        .linux => "linux",
+        .windows => "windows",
+        else => null,
+    };
+    if (package_target) |package_target_name| {
+        const package_run = b.addRunArtifact(dep.artifact("native"));
+        // The CLI resolves SDK-owned package inputs (the vendored
+        // WebView2 loader) from the framework root; the cached artifact's
+        // own location cannot derive it, so hand it over explicitly.
+        package_run.setEnvironmentVariable("NATIVE_SDK_PATH", dep.builder.pathFromRoot("."));
+        package_run.addArgs(&.{ "package", "--target", package_target_name, "--manifest", "app.zon", "--output" });
+        package_run.addArg(if (host_os == .macos)
+            b.fmt("zig-out/package/{s}.app", .{app_options.name})
+        else
+            b.fmt("zig-out/package/{s}", .{package_target_name}));
+        package_run.addArg("--binary");
+        package_run.addFileArg(exe.getEmittedBin());
+        // The archive and report names carry an optimize label; this
+        // build graph knows the packaged binary's REAL mode, so forward
+        // it instead of letting the CLI assume one.
+        package_run.addArgs(&.{ "--optimize", @tagName(app_optimize) });
+        // Forward the RESOLVED web-layer decision, never the raw inputs:
+        // this graph already decided web vs native-only for the exe it is
+        // packaging (app.zon declarations plus -Dweb-layer/-Dweb-engine),
+        // and the CLI re-inferring from app.zon alone would miss a
+        // flag-driven override — a WebView2-referencing exe packaged
+        // without its loader. Handing over the decision itself makes
+        // exe/package agreement structural.
+        package_run.addArgs(&.{ "--web-layer", if (web_layer) "include" else "exclude" });
+        // Same reasoning for the web engine: the CLI defaults to system, so
+        // a Chromium exe packaged without these flags would ship no CEF
+        // runtime (the generated build graph already forwards them).
+        package_run.addArgs(&.{ "--web-engine", @tagName(web_engine), "--cef-dir", cef_dir });
+        if (cef_auto_install) package_run.addArg("--cef-auto-install");
+        package_run.has_side_effects = true;
+        const package_step = b.step("package", "Create a distributable package via the native CLI");
+        package_step.dependOn(&package_run.step);
+    }
+
+    return .{ .exe = exe, .tests = tests, .install = install, .run = run };
+}
+
+/// Zig 0.16.0's self-hosted x86_64 backend miscompiles the SysV C calling
+/// convention for f32-heavy signatures with interleaved pointer arguments
+/// (`native_sdk_app_viewport`: 11 f32s + 2 pointers): both the caller and
+/// the callee place/read the wrong registers and stack slots, so safe-area
+/// insets arrive as garbage on x86_64 Debug builds while every LLVM-backed
+/// build is correct. Minimal repro (fails under `zig test`, passes with
+/// `-fllvm` on x86_64-linux):
+///
+///   fn take(a: ?*anyopaque, w: f32, h: f32, s: f32, p: ?*anyopaque,
+///           t: f32, r: f32, bo: f32, l: f32, kt: f32, kr: f32, kb: f32,
+///           kl: f32) callconv(.c) void { ... }
+///
+/// The same backend also mis-places STACK-passed integer/pointer arguments
+/// in long mixed signatures with interleaved doubles: calling the GTK
+/// host's `native_sdk_gtk_create_view` (22 params: 6 register ints, 4
+/// doubles, 12 stack ints/pointers/sizes) from self-hosted Debug code
+/// hands the clang-compiled callee arguments shifted by one stack slot
+/// from `visible` onward — the callee's `role` pointer reads as the
+/// caller's `enabled` value (a 4-byte 1 under 0xAA undefined fill,
+/// faulting at 0xaaaaaaaa00000001) and `role_len` reads as the role
+/// pointer. Register-passed arguments (`label`) arrive intact, which is
+/// why the crash appears only at the first stack-passed string. Verified
+/// against zig 0.16.0 on x86_64-linux with a standalone caller/callee
+/// pair: self-hosted Debug corrupts, `-fllvm` is correct.
+///
+/// Force the LLVM backend on x86_64 until the upstream backend is fixed;
+/// Release modes already default to LLVM, so this only changes Debug.
+pub fn useLlvmWorkaround(target: std.Build.ResolvedTarget) ?bool {
+    return if (target.result.cpu.arch == .x86_64) true else null;
+}
+
+fn exampleOptimizeMode(b: *std.Build, requested: ?std.builtin.OptimizeMode, default_mode: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    if (requested) |mode| return mode;
+    return switch (b.release_mode) {
+        .off => default_mode,
+        .any, .fast => .ReleaseFast,
+        .safe => .ReleaseSafe,
+        .small => .ReleaseSmall,
+    };
+}
+
+fn appModule(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, app_options: AppOptions, options_mod: *std.Build.Module, ts_stage: ?TsCoreStage) *std.Build.Module {
+    const native_sdk_mod = nativeSdkModuleWithTerminal(b, dep, target, optimize, app_options.terminal_sessions);
+    const runner_mod = b.createModule(.{
+        .root_source_file = dep.path("src/app_runner/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const manifest_mod = b.createModule(.{ .root_source_file = b.path(appPath(b, app_options.app_root, "app.zon")) });
+    runner_mod.addImport("native_sdk", native_sdk_mod);
+    runner_mod.addImport("build_options", options_mod);
+    runner_mod.addImport("app_manifest_zon", manifest_mod);
+
+    const app_mod = if (ts_stage) |stage|
+        // TypeScript core: the app module roots at the staged generated
+        // wiring (ts_core_main.zig beside the mirror core.zig, its shim
+        // runtime, and the app's markup).
+        b.createModule(.{
+            .root_source_file = stage.main_root,
+            .target = target,
+            .optimize = optimize,
+        })
+    else
+        localModule(b, target, optimize, appPath(b, app_options.app_root, app_options.main));
+    app_mod.addImport("native_sdk", native_sdk_mod);
+    app_mod.addImport("runner", runner_mod);
+    if (ts_stage != null) {
+        // The wiring derives scene/identity/security from app.zon itself.
+        app_mod.addImport("app_manifest_zon", manifest_mod);
+    }
+    if (ts_stage) |stage| {
+        // The compiled-core archive links behind the staged mirror; the
+        // toolchain's runtime needs libc.
+        app_mod.link_libc = true;
+        app_mod.addObjectFile(stage.archive);
+    }
+    return app_mod;
+}
+
+fn nativeSdkTarget(b: *std.Build) std.Build.ResolvedTarget {
+    const target = b.standardTargetOptions(.{});
+    if (target.result.os.tag != .macos) return target;
+
+    if (b.sysroot == null) {
+        b.sysroot = macosSdkPath(b) orelse b.sysroot;
+    }
+
+    var query = target.query;
+    query.os_tag = .macos;
+    query.os_version_min = .{ .semver = .{ .major = 11, .minor = 0, .patch = 0 } };
+    return b.resolveTargetQuery(query);
+}
+
+fn macosSdkPath(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
+        if (sdkroot.len > 0) return sdkroot;
+    }
+
+    const result = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer b.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        b.allocator.free(result.stdout);
+        return null;
+    }
+    return std.mem.trimEnd(u8, result.stdout, "\r\n");
+}
+
+fn localModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, path: []const u8) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(path),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn nativeSdkModule(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return nativeSdkModuleWithTerminal(b, dep, target, optimize, false);
+}
+
+fn nativeSdkModuleWithTerminal(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, terminal_sessions: bool) *std.Build.Module {
+    const geometry_mod = externalModule(b, dep, target, optimize, "src/primitives/geometry/root.zig");
+    const assets_mod = externalModule(b, dep, target, optimize, "src/primitives/assets/root.zig");
+    const app_dirs_mod = externalModule(b, dep, target, optimize, "src/primitives/app_dirs/root.zig");
+    const trace_mod = externalModule(b, dep, target, optimize, "src/primitives/trace/root.zig");
+    const app_manifest_mod = externalModule(b, dep, target, optimize, "src/primitives/app_manifest/root.zig");
+    const diagnostics_mod = externalModule(b, dep, target, optimize, "src/primitives/diagnostics/root.zig");
+    const platform_info_mod = externalModule(b, dep, target, optimize, "src/primitives/platform_info/root.zig");
+    const json_mod = externalModule(b, dep, target, optimize, "src/primitives/json/root.zig");
+    const canvas_mod = externalModule(b, dep, target, optimize, "src/primitives/canvas/root.zig");
+    canvas_mod.addImport("geometry", geometry_mod);
+    canvas_mod.addImport("json", json_mod);
+    const debug_mod = externalModule(b, dep, target, optimize, "src/debug/root.zig");
+    debug_mod.addImport("app_dirs", app_dirs_mod);
+    debug_mod.addImport("trace", trace_mod);
+
+    const native_sdk_mod = externalModule(b, dep, target, optimize, "src/root.zig");
+    native_sdk_mod.addImport("geometry", geometry_mod);
+    native_sdk_mod.addImport("assets", assets_mod);
+    native_sdk_mod.addImport("app_dirs", app_dirs_mod);
+    native_sdk_mod.addImport("trace", trace_mod);
+    native_sdk_mod.addImport("app_manifest", app_manifest_mod);
+    native_sdk_mod.addImport("diagnostics", diagnostics_mod);
+    native_sdk_mod.addImport("platform_info", platform_info_mod);
+    native_sdk_mod.addImport("json", json_mod);
+    native_sdk_mod.addImport("canvas", canvas_mod);
+    // The terminal-session emulator seam (see
+    // `AppOptions.terminal_sessions`): an opted-in app's OWN lazy
+    // ghostty pin resolves here with the app module's target/optimize;
+    // everything else gets the stub and never traverses ghostty's
+    // dependency graph. An opted-in build whose pin is still unfetched
+    // takes the stub for THIS configure pass — the build runner fetches
+    // the lazy dependency and re-runs, and the second pass wires the
+    // real module.
+    native_sdk_mod.addImport("terminal_vt", terminal_vt: {
+        if (terminal_sessions) {
+            if (b.lazyDependency("ghostty", .{
+                .target = target,
+                .optimize = optimize,
+                // Keep the vt module pure Zig: the SIMD paths pull
+                // vendored C++ dependencies the session store never uses.
+                .simd = false,
+                // Only the vt MODULE is consumed: ghostty's macOS app and
+                // xcframework artifacts default ON for Darwin hosts and
+                // their configure step resolves the iOS libc, which
+                // aborts on a machine with only the command-line tools.
+                .@"emit-xcframework" = false,
+                .@"emit-macos-app" = false,
+            })) |ghostty| {
+                const wrapper = externalModule(b, dep, target, optimize, "src/runtime/terminal_vt_ghostty.zig");
+                wrapper.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
+                break :terminal_vt wrapper;
+            }
+        }
+        break :terminal_vt externalModule(b, dep, target, optimize, "src/runtime/terminal_vt_stub.zig");
+    });
+    return native_sdk_mod;
+}
+
+fn externalModule(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, path: []const u8) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = dep.path(path),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+// -fno-sanitize=builtin on every ObjC compile: Zig 0.16.0's Debug UBSan
+// aborts any process whose first dispatch_once runs — the macOS SDK's
+// inline `_dispatch_once` ends in `__builtin_assume(*predicate == ~0l)`
+// (dispatch/once.h), Zig's bundled clang instruments that builtin, and the
+// check fires spuriously at startup; zig's ubsan_rt then cannot even decode
+// the report ("invalid enum value" / "passing zero to clz()" panics).
+// Reproduced with a 10-line `zig cc` program against both the 14.5 and
+// 26.0 SDKs. Release builds never hit it (no UBSan), which is why only
+// Debug-built examples (standardOptimizeOption default) crashed.
+fn linkPlatform(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, web_layer: bool, cef_dir: []const u8, cef_auto_install: bool) void {
+    if (platform == .macos) {
+        switch (web_engine) {
+            .system => {
+                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
+                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/macos/appkit_host.m"), .flags = flags });
+                app_mod.linkFramework("WebKit", .{});
+            },
+            .chromium => {
+                const cef_check = addCefCheck(b, target, cef_dir);
+                if (cef_auto_install) {
+                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
+                    cef_check.step.dependOn(&cef_auto.step);
+                }
+                exe.step.dependOn(&cef_check.step);
+                const include_arg = b.fmt("-I{s}", .{cef_dir});
+                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+                // The SDK's usr/include must stay a system include dir (searched after zig's
+                // bundled libc++/libc headers). A plain -I shadows libc++'s <string.h>/<math.h>
+                // wrappers in ObjC++ and surfaces SDK nullability gaps as a diagnostic flood.
+                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-isystem{s}/usr/include", .{sysroot}) else "";
+                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include, include_arg, define_arg } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=11.0", include_arg, define_arg };
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/macos/cef_host.mm"), .flags = flags });
+                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.a", .{cef_dir})));
+                app_mod.addFrameworkPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
+                app_mod.linkFramework("Chromium Embedded Framework", .{});
+                app_mod.addRPath(.{ .cwd_relative = "@executable_path/Frameworks" });
+            },
+        }
+        if (b.sysroot) |sysroot| {
+            app_mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+        }
+        app_mod.linkFramework("AppKit", .{});
+        // The audio playback service (the AppKit host's single AVPlayer).
+        app_mod.linkFramework("AVFoundation", .{});
+        // CVPixelBuffer for the video frame path (the video player's
+        // AVPlayerItemVideoOutput frames). CoreMedia's CMTime use stays
+        // header-only, but the pixel-buffer calls are real symbols.
+        app_mod.linkFramework("CoreVideo", .{});
+        // Spectrum analysis of the app's own playback: the MediaToolbox
+        // audio tap hands the player's PCM to the host, and Accelerate
+        // (vDSP) turns it into band magnitudes.
+        app_mod.linkFramework("MediaToolbox", .{});
+        app_mod.linkFramework("Accelerate", .{});
+        app_mod.linkFramework("Foundation", .{});
+        app_mod.linkFramework("CoreText", .{});
+        app_mod.linkFramework("UniformTypeIdentifiers", .{});
+        app_mod.linkFramework("Security", .{});
+        app_mod.linkFramework("Metal", .{});
+        app_mod.linkFramework("QuartzCore", .{});
+        app_mod.linkSystemLibrary("c", .{});
+        if (web_engine == .chromium) app_mod.linkSystemLibrary("c++", .{});
+    } else if (platform == .linux) {
+        switch (web_engine) {
+            .system => if (web_layer) {
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/linux/gtk_host.c"), .flags = &.{} });
+                app_mod.linkSystemLibrary("gtk4", .{});
+                app_mod.linkSystemLibrary("webkitgtk-6.0", .{});
+                app_mod.linkSystemLibrary("dl", .{});
+            } else {
+                // Native-only app (nothing in app.zon declares web use):
+                // compile the GTK host without the embedded web layer.
+                // The stub define excludes the layer outright — the host
+                // honors it before probing for the WebKitGTK header, so
+                // the layer stays out even on machines where the
+                // development package is installed — libwebkitgtk is
+                // neither linked nor required at runtime, and the
+                // executable carries no WebKit reference at all. This
+                // is the expected, configured state of every canvas
+                // app on Linux, so the stub compile is deliberately
+                // silent — no build note, no compiler diagnostic (the
+                // host's seam comment explains why even an
+                // informational pragma is dangerous); a stubbed host
+                // teaches at runtime by reporting WebViewNotFound the
+                // moment an app actually uses a WebView.
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/linux/gtk_host.c"), .flags = &.{"-DNATIVE_SDK_ALLOW_WEBKITGTK_STUB"} });
+                app_mod.linkSystemLibrary("gtk4", .{});
+                app_mod.linkSystemLibrary("dl", .{});
+            },
+            .chromium => {
+                const cef_check = addCefCheck(b, target, cef_dir);
+                if (cef_auto_install) {
+                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
+                    cef_check.step.dependOn(&cef_auto.step);
+                }
+                exe.step.dependOn(&cef_check.step);
+                const include_arg = b.fmt("-I{s}", .{cef_dir});
+                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/linux/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
+                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.a", .{cef_dir})));
+                app_mod.addLibraryPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
+                app_mod.linkSystemLibrary("cef", .{});
+                app_mod.addRPath(.{ .cwd_relative = "$ORIGIN" });
+            },
+        }
+        app_mod.linkSystemLibrary("c", .{});
+        if (web_engine == .chromium) app_mod.linkSystemLibrary("stdc++", .{});
+    } else if (platform == .windows) {
+        // Common-controls v6 side-by-side dependency: without this
+        // manifest the loader binds the system-default v5 assembly, which
+        // renders classic-styled controls and lacks the v6-only exports.
+        // The manifest also declares per-monitor-v2 DPI awareness so the
+        // canvas rasterizes at real device scale instead of Windows
+        // bitmap-stretching a 96-DPI surface on scaled displays.
+        exe.win32_manifest = dep.path("assets/native-sdk.manifest");
+        switch (web_engine) {
+            .system => if (web_layer) {
+                // The vendored WebView2 SDK header (third_party/webview2)
+                // turns on the host's embedded-WebView layer; the host
+                // fails the compile by design if it cannot be found.
+                app_mod.addIncludePath(dep.path("third_party/webview2/include"));
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/windows/webview2_host.cpp"), .flags = &.{"-std=c++17"} });
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/windows/gpu_surface_renderer.cpp"), .flags = &.{"-std=c++17"} });
+                // WebView2Loader.dll rides next to the installed app
+                // executable: the host loads it at runtime to discover
+                // the machine's WebView2 runtime. Canvas apps never
+                // touch it.
+                const loader = b.addInstallBinFile(dep.path(webView2LoaderSubPath(target)), "WebView2Loader.dll");
+                b.getInstallStep().dependOn(&loader.step);
+            } else {
+                // Native-only app (nothing in app.zon declares web use):
+                // compile the host without the embedded-WebView layer.
+                // The stub define excludes the layer outright — the host
+                // honors it before probing for the WebView2 header, so
+                // the layer stays out even on machines where the SDK
+                // headers are reachable through the system include paths
+                // — no WebView2Loader.dll is installed or path-wired,
+                // and the executable carries no reference to it at all.
+                // This is the expected, configured state of every
+                // canvas app on Windows, so the stub compile is
+                // deliberately silent — no build note, no compiler
+                // diagnostic (the host's seam comment explains why
+                // even an informational pragma is dangerous); a
+                // stubbed host teaches at runtime by reporting
+                // WebViewNotFound the moment an app actually uses a
+                // WebView.
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/windows/webview2_host.cpp"), .flags = &.{ "-std=c++17", "-DNATIVE_SDK_ALLOW_WEBVIEW2_STUB" } });
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/windows/gpu_surface_renderer.cpp"), .flags = &.{"-std=c++17"} });
+            },
+            .chromium => {
+                const cef_check = addCefCheck(b, target, cef_dir);
+                if (cef_auto_install) {
+                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
+                    cef_check.step.dependOn(&cef_auto.step);
+                }
+                exe.step.dependOn(&cef_check.step);
+                const include_arg = b.fmt("-I{s}", .{cef_dir});
+                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/windows/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
+                app_mod.addCSourceFile(.{ .file = dep.path("src/platform/windows/gpu_surface_renderer.cpp"), .flags = &.{"-std=c++17"} });
+                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.lib", .{cef_dir})));
+                app_mod.addLibraryPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
+            },
+        }
+        app_mod.linkSystemLibrary("c", .{});
+        app_mod.linkSystemLibrary("c++", .{});
+        app_mod.linkSystemLibrary("user32", .{});
+        app_mod.linkSystemLibrary("gdi32", .{});
+        // Retained gpu_surface packets are composited into a hardware
+        // Direct2D target; DirectWrite draws the engine-measured text
+        // runs (including registered in-memory fonts) on that target.
+        app_mod.linkSystemLibrary("d2d1", .{});
+        app_mod.linkSystemLibrary("dwrite", .{});
+        app_mod.linkSystemLibrary("imm32", .{});
+        app_mod.linkSystemLibrary("comctl32", .{});
+        app_mod.linkSystemLibrary("ole32", .{});
+        app_mod.linkSystemLibrary("oleacc", .{});
+        app_mod.linkSystemLibrary("shell32", .{});
+        // The audio backend: Media Foundation (session + source resolver
+        // + streaming audio renderer) and WinHTTP (the cache fill).
+        app_mod.linkSystemLibrary("mf", .{});
+        app_mod.linkSystemLibrary("mfplat", .{});
+        app_mod.linkSystemLibrary("winhttp", .{});
+        if (web_engine == .chromium) app_mod.linkSystemLibrary("libcef", .{});
+    }
+}
+
+/// The vendored WebView2Loader.dll for the target architecture, relative
+/// to the framework root.
+fn webView2LoaderSubPath(target: std.Build.ResolvedTarget) []const u8 {
+    return if (target.result.cpu.arch == .aarch64)
+        "third_party/webview2/arm64/WebView2Loader.dll"
+    else
+        "third_party/webview2/x64/WebView2Loader.dll";
+}
+
+/// `zig build run` executes the cached artifact, which has no installed
+/// WebView2Loader.dll beside it; the vendored loader's directory goes on
+/// the run step's PATH so the host's LoadLibrary resolves it in dev runs.
+fn addWebView2RuntimeRunFiles(dep: *std.Build.Dependency, target: std.Build.ResolvedTarget, run: *std.Build.Step.Run, web_engine: WebEngineOption, web_layer: bool) void {
+    if (web_engine != .system) return;
+    if (!web_layer) return;
+    if (target.result.os.tag != .windows) return;
+    const loader_dir = std.fs.path.dirname(webView2LoaderSubPath(target)).?;
+    run.addPathDir(dep.builder.pathFromRoot(loader_dir));
+}
+
+fn addCefRuntimeRunFiles(b: *std.Build, target: std.Build.ResolvedTarget, run: *std.Build.Step.Run, exe: *std.Build.Step.Compile, web_engine: WebEngineOption, cef_dir: []const u8) void {
+    if (web_engine != .chromium) return;
+    if (target.result.os.tag != .macos) return;
+    const copy = b.addSystemCommand(&.{
+        "sh", "-c",
+        b.fmt(
+            \\set -e
+            \\exe="$0"
+            \\exe_dir="$(dirname "$exe")"
+            \\rm -rf "zig-out/Frameworks/Chromium Embedded Framework.framework" "zig-out/bin/Frameworks/Chromium Embedded Framework.framework" ".zig-cache/o/Frameworks/Chromium Embedded Framework.framework" &&
+            \\mkdir -p "zig-out/Frameworks" "zig-out/bin/Frameworks" ".zig-cache/o/Frameworks" "$exe_dir" &&
+            \\cp -R "{s}/Release/Chromium Embedded Framework.framework" "zig-out/Frameworks/" &&
+            \\cp -R "{s}/Release/Chromium Embedded Framework.framework" "zig-out/bin/Frameworks/" &&
+            \\cp -R "{s}/Release/Chromium Embedded Framework.framework" ".zig-cache/o/Frameworks/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/libEGL.dylib" "$exe_dir/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/libGLESv2.dylib" "$exe_dir/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/libvk_swiftshader.dylib" "$exe_dir/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/vk_swiftshader_icd.json" "$exe_dir/"
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir }),
+    });
+    copy.addFileArg(exe.getEmittedBin());
+    run.step.dependOn(&copy.step);
+}
+
+fn addCefCheck(b: *std.Build, target: std.Build.ResolvedTarget, cef_dir: []const u8) *std.Build.Step.Run {
+    const script = switch (target.result.os.tag) {
+        .macos => b.fmt(
+            \\test -f "{s}/include/cef_app.h" &&
+            \\test -d "{s}/Release/Chromium Embedded Framework.framework" &&
+            \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.a" || {{
+            \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
+            \\  echo "Fix with: native cef install --dir {s}" >&2
+            \\  exit 1
+            \\}}
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
+        .linux => b.fmt(
+            \\test -f "{s}/include/cef_app.h" &&
+            \\test -f "{s}/Release/libcef.so" &&
+            \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.a" || {{
+            \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
+            \\  echo "Fix with: native cef install --dir {s}" >&2
+            \\  exit 1
+            \\}}
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
+        .windows => b.fmt(
+            \\test -f "{s}/include/cef_app.h" &&
+            \\test -f "{s}/Release/libcef.dll" &&
+            \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.lib" || {{
+            \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
+            \\  echo "Fix with: native cef install --dir {s}" >&2
+            \\  exit 1
+            \\}}
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
+        else => "echo unsupported CEF target >&2; exit 1",
+    };
+    return b.addSystemCommand(&.{ "sh", "-c", script });
+}
+
+/// What the build graph reads out of app.zon: the web-engine/CEF knobs
+/// and the web-layer inference inputs. An unreadable or unparsable
+/// manifest falls back to the system engine WITH the web layer kept —
+/// over-inclusion is a size cost, wrong exclusion is a broken app.
+const AppManifestBuildConfig = struct {
+    web_engine: WebEngineOption = .system,
+    cef_dir: []const u8 = "third_party/cef/macos",
+    cef_auto_install: bool = false,
+    webview_layer: WebLayerOption = .auto,
+    /// The first web declaration found (for teaching messages), or null
+    /// when app.zon declares no web use. `web_engine = "system"` alone is
+    /// NOT web intent — it is the default in many canvas manifests.
+    web_declaration: ?web_layer_contract.Declaration = null,
+};
+
+/// The lenient app.zon shape the build graph parses for inference: only
+/// the fields that decide the web layer and the web engine; everything
+/// else is ignored. Full schema validation stays with `native validate`
+/// and the runner's comptime import.
+const InferenceManifest = struct {
+    capabilities: []const []const u8 = &.{},
+    web_engine: []const u8 = "system",
+    webview_layer: []const u8 = "auto",
+    core_compiler: []const u8 = "external",
+    cef: struct {
+        dir: []const u8 = "third_party/cef/macos",
+        auto_install: bool = false,
+    } = .{},
+    frontend: ?struct {} = null,
+    shell: struct {
+        windows: []const struct {
+            views: []const struct {
+                kind: []const u8 = "",
+            } = &.{},
+        } = &.{},
+    } = .{},
+};
+
+fn defaultCefDir(platform: PlatformOption, configured: []const u8) []const u8 {
+    if (!std.mem.eql(u8, configured, "third_party/cef/macos")) return configured;
+    return switch (platform) {
+        .linux => "third_party/cef/linux",
+        .windows => "third_party/cef/windows",
+        else => configured,
+    };
+}
+
+/// Resolve an app-relative path against `app_root` (see AppOptions). Kept
+/// lexical: `b.path` rejects absolute paths and the generated build graph
+/// hands us "../..", which openat/b.path both resolve fine.
+fn appPath(b: *std.Build, app_root: []const u8, sub_path: []const u8) []const u8 {
+    if (app_root.len == 0 or std.mem.eql(u8, app_root, ".")) return sub_path;
+    return b.pathJoin(&.{ app_root, sub_path });
+}
+
+fn appManifestBuildConfig(b: *std.Build, app_root: []const u8) AppManifestBuildConfig {
+    // The fallback for a manifest this lenient parse cannot read keeps
+    // the web layer (see AppManifestBuildConfig): a shape mismatch here
+    // is not proof the app declares no web use.
+    const fallback: AppManifestBuildConfig = .{ .web_declaration = .unreadable_manifest };
+    const source = b.build_root.handle.readFileAlloc(b.graph.io, appPath(b, app_root, "app.zon"), b.allocator, .limited(1024 * 1024)) catch return fallback;
+    const source_z = b.allocator.dupeZ(u8, source) catch return fallback;
+    @setEvalBranchQuota(2000);
+    const raw = std.zon.parse.fromSliceAlloc(InferenceManifest, b.allocator, source_z, null, .{ .ignore_unknown_fields = true }) catch return fallback;
+    // `.core_compiler` names the one lane there is; validated here so
+    // the removed transpiled lane's spelling teaches at configure time.
+    if (!std.mem.eql(u8, raw.core_compiler, "external")) {
+        if (std.mem.eql(u8, raw.core_compiler, "transpiler")) @panic(core_compiler_teaching);
+        @panic("\napp.zon .core_compiler must be \"external\" (the default and only lane)\n");
+    }
+    return .{
+        .web_engine = web_layer_contract.parseWebEngine(raw.web_engine) orelse .system,
+        .cef_dir = raw.cef.dir,
+        .cef_auto_install = raw.cef.auto_install,
+        .webview_layer = web_layer_contract.parseWebViewLayer(raw.webview_layer) orelse @panic("app.zon .webview_layer must be \"auto\", \"include\", or \"exclude\""),
+        .web_declaration = web_layer_contract.manifestDeclaration(raw),
+    };
+}
+
+/// The web-layer decision for this build: the shared contract fed this
+/// boundary's inputs — the manifest declarations from the lenient parse
+/// and the engine RESOLVED from `-Dweb-engine` orelse app.zon. WEB means
+/// the embedded-WebView layer compiles in; NATIVE-ONLY compiles the host
+/// without it. `.webview_layer` (and `-Dweb-layer`) override the
+/// inference — but an exclude that contradicts a web declaration is a
+/// hard configure error, never a silently broken app.
+fn resolveWebLayer(config: AppManifestBuildConfig, web_engine: WebEngineOption, override: ?WebLayerOption) bool {
+    const setting = override orelse config.webview_layer;
+    const declaration = web_layer_contract.foldEngine(config.web_declaration, web_engine);
+    const decision = web_layer_contract.decide(setting, declaration) catch std.debug.panic(
+        "the web layer is excluded ({s}) but the app declares web use ({s}); remove the exclude or drop the web declaration",
+        .{ if (override != null) "-Dweb-layer=exclude" else "app.zon .webview_layer = \"exclude\"", declaration.?.text() },
+    );
+    return decision.enabled;
+}
