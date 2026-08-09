@@ -13,7 +13,7 @@ A handoff **spec** for **Kakuriyo**: standalone dark desktop vault (Win11 + NixO
 - Canonical tracker: GitHub Issues (`docs/issue-tracker.md`). `.scratch/kakuriyo/issues/` is archive only.
 - Domain language: English product UI/terms; see `CONTEXT.md` at repo root.
 - Skills every session: grilling, domain-modeling, research, prototype.
-- Stack preference: **gpui** (confirmed go-with-caveats).
+- Stack preference: **gpui** (confirmed go-with-caveats; Native SDK evaluated — reference only, see #24).
 - Privacy bar: local encrypted at rest + auto-lock; not “hide from screen share only”.
 - Cost: $0 ops (no paid backend). Offline-first; Preview may fetch when online and cache locally.
 - Plan, don’t ship the map’s destination app inside this effort unless Notes later override.
@@ -29,6 +29,8 @@ A handoff **spec** for **Kakuriyo**: standalone dark desktop vault (Win11 + NixO
 - [Main layout prototype](https://github.com/YuukiFST/Kakuriyo/issues/6) — v1 = IDE B (activity + tree with Entries + editor|Preview), TRUE BLACK; secrets = structured User/Password rows over Body + `•••` tree badge; density deferred to keyboard ticket
 - [Keyboard-first navigation](https://github.com/YuukiFST/Kakuriyo/issues/7) — Vim Motion ON default (hjkl, gx, a/A, x/p, Ctrl-w, / filter); Classic OFF via Settings+palette; Preview on select; Delete modal y/Esc; clipboard SO ≠ tree move; compact ring inset
 - [Unlock and Auto-lock policy](https://github.com/YuukiFST/Kakuriyo/issues/17) — create min 8 + confirm; Unlock-only UI; idle 5m default (1/5/15/30/Never); quit=lock; minimize OFF default; auto-save then lock; Unlock lockout 5 fails/5m; change PW = current+new+confirm rewrap
+
+- [Native SDK vs GPUI (agent DX)](https://github.com/YuukiFST/Kakuriyo/issues/24) — keep GPUI; Native easier for agents but worse fit for NixOS-first + Rust crypto; reference only
 
 ## Not yet specified
 
