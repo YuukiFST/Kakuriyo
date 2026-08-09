@@ -119,8 +119,12 @@ pub const Session = struct {
     }
 
     /// Returns the payload view (owned by the session; valid until the
-    /// next op or lock).
+    /// next op or lock). Any unlock attempt starts from the locked
+    /// state: a failed re-auth must never leave a previously unlocked
+    /// session readable (smoke oracle: wrong password on an unlocked
+    /// session must end locked).
     pub fn unlock(self: *Session, password: []const u8) UnlockError![]const u8 {
+        self.lock();
         try validatePassword(password);
 
         const bytes = self.readFile() catch |err| switch (err) {

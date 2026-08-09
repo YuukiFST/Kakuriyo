@@ -45,9 +45,11 @@ export type Msg =
   | { readonly kind: "pinged" }
   | { readonly kind: "ping_failed" };
 
-// `pinged`/`ping_failed` are host-issued (reserved for routed answers);
-// nothing dispatches them today.
-export const viewUnbound = ["pinged", "ping_failed"] as const;
+// `pinged`/`ping_failed` are host-issued (reserved for routed answers),
+// `ping_attempt` is dispatched by the test harness, `echo` is read by
+// Zig-side tests only — the scriptc check demands they be declared
+// unbound-from-markup.
+export const viewUnbound = ["echo", "ping_attempt", "pinged", "ping_failed"] as const;
 
 export function initialModel(): Model {
   return { echo: -0.5 };

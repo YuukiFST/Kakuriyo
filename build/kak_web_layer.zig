@@ -29,7 +29,6 @@
 //!   runner's guard fires on every manifest-visible web declaration,
 //!   while an engine resolved to Chromium by flag alone stays a
 //!   configure-time error in the build graph, which does see the flag.
-
 //! VENDORED from @native-sdk/cli 0.8.3 (commit 30c1410)
 //! src/primitives/app_manifest/web_layer.zig, Apache-2.0, with the two
 //! enums inlined verbatim from src/primitives/app_manifest/types.zig
