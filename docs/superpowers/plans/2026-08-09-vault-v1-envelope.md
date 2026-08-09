@@ -385,13 +385,13 @@ git add src/vault build.zig tools/gates && git-safe-commit "feat: close vault v1
 
   Expected: FAIL (no dispatch).
 
-- [ ] **Step 2: Implement the dispatch** — frame parser (bounds-checked), op table, error-code mapping, `sendFn` handling `vault.lock` only; every `requestFn` path answers exactly once (guard: an internal `answered` flag per call — a request that could not be answered is answered `ok=false "internal"`).
+- [x] **Step 2: Implement the dispatch** — frame parser (bounds-checked), op table, error-code mapping, `sendFn` handling `vault.lock` only; every `requestFn` path answers exactly once (guard: an internal `answered` flag per call — a request that could not be answered is answered `ok=false "internal"`).
 
-- [ ] **Step 3: Green** — `nix-shell --run "zig build test-vault"`.
+- [x] **Step 3: Green** — `nix-shell --run "zig build test-vault"`.
 
-- [ ] **Step 4: Wire the real ops into the effects channel** — Task 1's round-trip test is extended in Task 5; for now verify the wiring still compiles: `nix-shell --run "native check && zig build test"` (the app module now carries the full module).
+- [x] **Step 4: Wire the real ops into the effects channel** — Task 1's round-trip test is extended in Task 5; for now verify the wiring still compiles: `nix-shell --run "native check && zig build test"` (the app module now carries the full module).
 
-- [ ] **Step 5: Commit** — `git-safe-commit "feat: dispatch vault.* host ops over framed protocol"`.
+- [x] **Step 5: Commit** — `git-safe-commit "feat: dispatch vault.* host ops over framed protocol"`.
 
 ---
 
