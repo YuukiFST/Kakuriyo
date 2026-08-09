@@ -43,3 +43,19 @@ _Avoid_: Notes, Content, description, Secret (as the field name); markdown docum
 **Preview**:
 The visual card (title/image/metadata) shown for an Entry that has a URL, typically in the right-hand panel of the IDE-style split.
 _Avoid_: thumbnail-only, embed, iframe
+
+**Export**:
+Writing a portable encrypted copy of the Vault file (`.kakuriyo`) for manual transfer between machines; not sync.
+_Avoid_: sync, cloud backup, age export (v1)
+
+**Import**:
+Loading a `.kakuriyo` Vault file into Kakuriyo while unlocked, after prompting for that file's Master Password.
+_Avoid_: restore (ambiguous), open (as generic file open), sync pull
+
+**Replace**:
+Import mode that swaps the current Vault for the imported file after an automatic local `.bak` of the previous Vault.
+_Avoid_: overwrite without backup, merge
+
+**Merge**:
+Import mode that combines Entries and Collections from a backup into the current Vault by stable UUID, asking the user on each conflict.
+_Avoid_: sync, automatic last-write-wins without prompt
