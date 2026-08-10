@@ -39,6 +39,9 @@ One command runs every oracle (contract check, effects seam, vault crypto,
 fmt, smoke, mutation):
 
 ```sh
+# first time after clone
+npm install
+npm install --prefix vendor/native-sdk/packages/core
 nix-shell --run "npm run gate"
 ```
 

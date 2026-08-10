@@ -35,7 +35,7 @@ jobs:
       - name: Install npm dependencies
         run: |
           npm install
-          npm ci --prefix vendor/native-sdk/packages/core
+          npm install --prefix vendor/native-sdk/packages/core
 
       - name: Install native CLI
         run: npm install -g @native-sdk/cli@0.8.3

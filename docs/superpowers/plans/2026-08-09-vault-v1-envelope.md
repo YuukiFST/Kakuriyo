@@ -466,6 +466,6 @@ git add src/vault build.zig tools/gates && git-safe-commit "feat: close vault v1
 
 ## Task 6: Completion audit
 
-- [ ] **Step 1: Fresh-clone gate run** — from a clean checkout (stash/`git worktree` or re-clone to /tmp): `nix-shell --run "npm run gate"` green end-to-end, plus `native build` (ReleaseFast binary) and `native check --strict`.
+- [x] **Step 1: Fresh-clone gate run** — from a clean checkout (stash/`git worktree` or re-clone to /tmp): `nix-shell --run "npm run gate"` green end-to-end, plus `native build` (ReleaseFast binary) and `native check --strict`.
 - [ ] **Step 2: Objective checklist mapping** — walk the DONE WHEN list against evidence: (1) scaffold + eject — `build.zig` owned + `native eject` provenance in README; (2) `vault.*` over `Cmd.request`/`bindHostCalls` — round-trip tests green; (3) envelope closed — vault.zig oracles green + format doc; (4) smoke items — smoke runner PASS output; (5) /prove — oracles-before-code commits (check `git log` order), gates exit non-zero, ledger present, no oracle softening (audit the diff history for any assertion edits alongside implementation).
 - [ ] **Step 3: Report + ask before push.**
