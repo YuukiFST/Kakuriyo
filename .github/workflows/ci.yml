@@ -10,74 +10,35 @@ permissions:
   contents: read
 
 env:
-  # build.zig.zon expects the Native SDK framework checkout at this
-  # path, relative to the repository root. Adjust both together if
-  # your framework checkout lives elsewhere.
-  NATIVE_SDK_PATH: "../../home/yuuki/.npm-global/lib/node_modules/@native-sdk/cli"
+  # scriptc's C backend: zig cc bundles clang + sysroots on CI runners
+  # that ship no system clang (same as shell.nix on NixOS).
+  SCRIPTC_CC: zigcc
 
 jobs:
-  test:
-    name: Logic Tests
+  gates:
+    name: Gate suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: vercel-labs/setup-zig@v1
-        with:
-          version: 0.16.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Fetch native-sdk
-        run: |
-          if [ ! -f "$NATIVE_SDK_PATH/build.zig" ]; then
-            git clone --depth 1 https://github.com/vercel-labs/native.git "$NATIVE_SDK_PATH"
-          fi
-      - name: Install the core compiler dependency
-        # src/core.ts compiles to native code at build time: the
-        # @native-sdk/core frontend and the external core compiler
-        # run from the SDK dependency and arrive with one install.
-        run: npm ci --prefix "$NATIVE_SDK_PATH/packages/core"
-      - run: zig build test -Dplatform=null
 
-  smoke:
-    name: Automation Smoke (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: vercel-labs/setup-zig@v1
         with:
           version: 0.16.0
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - name: Install GTK and Xvfb
-        # No WebKitGTK dev package: this app declares no web use, so its
-        # Linux host compiles without the embedded web layer and never
-        # links WebKitGTK (install it alongside a .frontend block or
-        # the "webview" capability if the app grows web content).
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev xvfb
-      - name: Fetch native-sdk
+          node-version: 24
+
+      - name: Install GTK and pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev pkg-config
+
+      - name: Install npm dependencies
         run: |
-          if [ ! -f "$NATIVE_SDK_PATH/build.zig" ]; then
-            git clone --depth 1 https://github.com/vercel-labs/native.git "$NATIVE_SDK_PATH"
-          fi
-      - name: Install the core compiler dependency
-        # src/core.ts compiles to native code at build time: the
-        # @native-sdk/core frontend and the external core compiler
-        # run from the SDK dependency and arrive with one install.
-        run: npm ci --prefix "$NATIVE_SDK_PATH/packages/core"
-      - name: Build the Native SDK CLI
-        run: cd "$NATIVE_SDK_PATH" && zig build
-      - name: Build and drive the app headless
-        run: |
-          set -euo pipefail
-          cli="$NATIVE_SDK_PATH/zig-out/bin/native"
-          zig build -Dplatform=linux -Dweb-engine=system -Dautomation=true
-          rm -rf .zig-cache/native-sdk-automation
-          xvfb-run -a ./zig-out/bin/kakuriyo-scaffold &
-          pid=$!
-          trap 'kill "$pid" >/dev/null 2>&1 || true' EXIT
-          "$cli" automate wait
-          "$cli" automate assert 'gpu_nonblank=true' 'role=button name="Reset"' 'total: 0'
-          "$cli" automate screenshot main-canvas
-          test -s .zig-cache/native-sdk-automation/screenshot-main-canvas.png
+          npm install
+          npm ci --prefix vendor/native-sdk/packages/core
+
+      - name: Install native CLI
+        run: npm install -g @native-sdk/cli@0.8.3
+
+      - name: Run gates
+        run: npm run gate

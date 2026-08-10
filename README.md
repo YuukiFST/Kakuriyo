@@ -3,9 +3,10 @@
 Local encrypted personal vault for private Entries (links and other text),
 organized in nested Collections. Desktop-only, offline-first, no telemetry.
 
-**Status:** vault-v1 envelope in progress — the Zig host service and the
-[Task 1 seam](../../docs/superpowers/plans/2026-08-09-vault-v1-envelope.md).
+**Status:** vault v1 envelope closed in Zig (crypto + host dispatch + gates).
+Session UI (unlock/save/lock screens) waits on the SDK compiled-TS lane fix.
 Canonical tracker: [GitHub Issues](https://github.com/YuukiFST/Kakuriyo/issues).
+Plan: [vault-v1 envelope](docs/superpowers/plans/2026-08-09-vault-v1-envelope.md).
 
 The tree below is the Native SDK scaffold (`native init`), modified:
 
@@ -31,6 +32,18 @@ Edit `src/core.ts` for behavior, `src/app.native` for the view, and
 `app.zon` for windows/identity/permissions. Markup binds the model's
 field names exactly as core.ts wrote them (`tickCount` -> `{tickCount}`),
 and exported single-model helpers bind as derived values (`{total}`).
+
+## Gates
+
+One command runs every oracle (contract check, effects seam, vault crypto,
+fmt, smoke, mutation):
+
+```sh
+nix-shell --run "npm run gate"
+```
+
+CI runs the same script. See [GATES.md](GATES.md) for the gate table and
+mutation dispositions.
 
 ## Try the core loop
 

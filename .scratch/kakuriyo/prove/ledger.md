@@ -9,6 +9,7 @@
 | effects seam (`host_roundtrip_tests`) | T1 | binding oracles | ping sendFn, requestFn echo, unknown reject | n/a | gate-ts |
 | smoke driver (`smoke.zig`) | T2 | end-to-end file | full password lifecycle + rewrap region check | n/a | smoke |
 | TS core lane | documented constraint | — | frame-arena UAF; no Cmd in core | n/a | gate-check (viewUnbound patch) |
+| CI (`npm run gate`) | T1 | ubuntu gate suite | same script as local nix-shell | n/a | `.github/workflows/ci.yml` |
 
 ## Skipped / deferred
 
