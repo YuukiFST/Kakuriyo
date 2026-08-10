@@ -12,5 +12,5 @@
     <text>Unlock / save / lock screens wait on the TS compiled-lane fix (0.8.3).</text>
     <text>Until then, verify with: nix-shell --run "npm run gate"</text>
   </column>
-  <button label="Ping host seam" on-press="ping_attempt" />
+  <button label="Ping host seam" on-press="ping_attempt:{lastPing}" />
 </column>
