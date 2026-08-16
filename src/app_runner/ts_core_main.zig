@@ -268,6 +268,7 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = @import("host_roundtrip_tests.zig");
     _ = @import("app_tree_cap_tests.zig");
+    _ = @import("app_keyboard.zig");
 }
 
 /// The startup window title: the scene's first window title, else the

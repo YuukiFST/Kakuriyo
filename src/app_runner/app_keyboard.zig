@@ -95,62 +95,108 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+fn testKey(key: []const u8) canvas.WidgetKeyboardEvent {
+    return .{ .phase = .key_down, .key = key, .modifiers = .{} };
+}
+
+fn unlockedController(path: []const u8) !app_controller.AppController {
+    var ctrl = try app_controller.AppController.init(std.testing.io, std.testing.allocator, path);
+    ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
+    return ctrl;
+}
+
 test "bare digits and letters do not steal when tree focused" {
-    const io = std.testing.io_instance;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
     defer alloc.free(path);
 
-    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    var ctrl = try unlockedController(path);
     defer ctrl.deinit();
     app_dispatch.setController(&ctrl);
-    ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
 
-    try std.testing.expect(handleKeyEvent(.{ .key = "1", .modifiers = .{} }) == null);
-    try std.testing.expect(handleKeyEvent(.{ .key = "2", .modifiers = .{} }) == null);
-    try std.testing.expect(handleKeyEvent(.{ .key = "a", .modifiers = .{} }) == null);
-    try std.testing.expect(handleKeyEvent(.{ .key = "j", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(testKey("1")) == null);
+    try std.testing.expect(handleKeyEvent(testKey("2")) == null);
+    try std.testing.expect(handleKeyEvent(testKey("a")) == null);
+    try std.testing.expect(handleKeyEvent(testKey("j")) == null);
 }
 
 test "editor focus ignores tree motion keys" {
-    const io = std.testing.io_instance;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
     defer alloc.free(path);
 
-    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    var ctrl = try unlockedController(path);
     defer ctrl.deinit();
     app_dispatch.setController(&ctrl);
-    ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
     ctrl.slots.focus_region = 1;
 
-    try std.testing.expect(handleKeyEvent(.{ .key = "j", .modifiers = .{} }) == null);
-    try std.testing.expect(handleKeyEvent(.{ .key = "a", .modifiers = .{} }) == null);
-    try std.testing.expect(handleKeyEvent(.{ .key = "arrowdown", .modifiers = .{} }) == null);
-    try std.testing.expect(handleKeyEvent(.{ .key = "delete", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(testKey("j")) == null);
+    try std.testing.expect(handleKeyEvent(testKey("a")) == null);
+    try std.testing.expect(handleKeyEvent(testKey("arrowdown")) == null);
+    try std.testing.expect(handleKeyEvent(testKey("delete")) == null);
+}
+
+test "entry select keeps tree keyboard; arrowup is move_tree" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var ctrl = try unlockedController(path);
+    defer ctrl.deinit();
+    app_dispatch.setController(&ctrl);
+    ctrl.setPasswordText("test-password-123");
+    ctrl.slots.confirm_password_mode = 1;
+    ctrl.setConfirmText("test-password-123");
+    ctrl.createVault();
+    ctrl.addCollection();
+    ctrl.addEntry();
+    ctrl.selectEntryAt(0);
+    try std.testing.expectEqual(@as(u8, 0), ctrl.slots.focus_region);
+
+    const msg = handleKeyEvent(testKey("arrowup"));
+    try std.testing.expect(msg != null);
+    try std.testing.expect(msg.? == .move_tree);
+}
+
+test "tab cycles focus from tree or editor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var ctrl = try unlockedController(path);
+    defer ctrl.deinit();
+    app_dispatch.setController(&ctrl);
+    ctrl.slots.focus_region = 0;
+    var msg = handleKeyEvent(testKey("tab"));
+    try std.testing.expect(msg != null);
+    try std.testing.expect(msg.? == .focus_cycle);
+
+    ctrl.slots.focus_region = 1;
+    msg = handleKeyEvent(testKey("tab"));
+    try std.testing.expect(msg != null);
+    try std.testing.expect(msg.? == .focus_cycle);
 }
 
 test "arrowdown moves tree" {
-    const io = std.testing.io_instance;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
     defer alloc.free(path);
 
-    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    var ctrl = try unlockedController(path);
     defer ctrl.deinit();
     app_dispatch.setController(&ctrl);
-    ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
 
-    const msg = handleKeyEvent(.{
-        .key = "arrowdown",
-        .modifiers = .{},
-    });
+    const msg = handleKeyEvent(testKey("arrowdown"));
     try std.testing.expect(msg != null);
     try std.testing.expect(msg.? == .move_tree);
 }

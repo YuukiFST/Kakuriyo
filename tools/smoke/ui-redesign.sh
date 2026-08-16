@@ -17,7 +17,9 @@ grep -q 'ingestPaste into selected nested collection not host inbox' src/app_run
 grep -q 'named group paste creates collection and keeps urls together' src/app_runner/app_tree_cap_tests.zig || fail "missing named-folder keep-together oracle"
 grep -q 'entry select keeps listing folder and tree focus; tree arrows move from that folder' src/app_runner/app_tree_cap_tests.zig || fail "missing listing-folder tree-nav oracle"
 grep -q 'try std.testing.expectEqual(@as(u8, 0), ctrl.slots.focus_region)' src/app_runner/app_tree_cap_tests.zig || fail "missing entry-select tree-keyboard oracle"
-grep -q 'if (eql(key, "tab"))' src/app_runner/app_keyboard.zig || fail "missing Tab focus_cycle"
+grep -q 'entry select keeps tree keyboard; arrowup is move_tree' src/app_runner/app_keyboard.zig || fail "missing arrowup-after-entry-select keyboard oracle"
+grep -q 'tab cycles focus from tree or editor' src/app_runner/app_keyboard.zig || fail "missing Tab focus_cycle oracle"
+grep -q '_ = @import("app_keyboard.zig")' src/app_runner/ts_core_main.zig || fail "missing app_keyboard test import"
 grep -q 'listingCollectionId' src/app_runner/app_controller.zig || fail "missing listingCollectionId"
 grep -q 'destinationForIngest' src/app_runner/app_controller.zig || fail "missing destinationForIngest"
 grep -q 'formatExtractedUrls splits glued urls one per line' src/vault/domain.zig || fail "missing glued-url extract oracle"
@@ -34,4 +36,4 @@ if [ "${SKIP_TESTS:-}" != "1" ]; then
   zig build test-vault --summary all || fail "zig build test-vault"
 fi
 
-echo "PASS ui-redesign: create/unlock, paste keep-together (Inbox/named/nested), listing-folder tree-nav, entry-select tree keyboard, cache-first select, senhas gate, lock clears gate"
+echo "PASS ui-redesign: create/unlock, paste keep-together (Inbox/named/nested), listing-folder tree-nav, entry-select tree keyboard, Tab/arrow keyboard oracles, cache-first select, senhas gate, lock clears gate"
