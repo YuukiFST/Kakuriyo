@@ -154,7 +154,17 @@ test "entry select keeps tree keyboard; arrowup is move_tree" {
     ctrl.slots.confirm_password_mode = 1;
     ctrl.setConfirmText("test-password-123");
     ctrl.createVault();
+
     ctrl.addCollection();
+    const first_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    ctrl.selected_id = null;
+    ctrl.addCollection();
+    const second_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    ctrl.selected_id = null;
+    ctrl.addCollection();
+    const third_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+
+    ctrl.selectNode(third_id);
     ctrl.addEntry();
     ctrl.selectEntryAt(0);
     try std.testing.expectEqual(@as(u8, 0), ctrl.slots.focus_region);
@@ -162,6 +172,10 @@ test "entry select keeps tree keyboard; arrowup is move_tree" {
     const msg = handleKeyEvent(testKey("arrowup"));
     try std.testing.expect(msg != null);
     try std.testing.expect(msg.? == .move_tree);
+    try std.testing.expect(app_dispatch.handle(msg.?));
+    try std.testing.expectEqualSlices(u8, &second_id, &(ctrl.selected_id orelse return error.TestUnexpectedResult));
+    try std.testing.expect(ctrl.hasSelectedCollection());
+    try std.testing.expect(!std.mem.eql(u8, &first_id, &second_id));
 }
 
 test "tab cycles focus from tree or editor" {
