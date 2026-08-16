@@ -481,10 +481,10 @@ pub const Store = struct {
                 },
                 .entry => |e| {
                     if (self.findIndex(e.id) == null) {
-                    try self.addEntry(e.id, e.parent_id, e.title, e.url, e.body, e.created_ms, e.updated_ms);
-                    if (e.preview_title.len > 0 or e.preview_description.len > 0 or e.preview_image.len > 0) {
-                        try self.setPreview(e.id, e.preview_title, e.preview_description, e.preview_image);
-                    }
+                        try self.addEntry(e.id, e.parent_id, e.title, e.url, e.body, e.created_ms, e.updated_ms);
+                        if (e.preview_title.len > 0 or e.preview_description.len > 0 or e.preview_image.len > 0) {
+                            try self.setPreview(e.id, e.preview_title, e.preview_description, e.preview_image);
+                        }
                     }
                 },
             }
