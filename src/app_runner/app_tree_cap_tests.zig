@@ -443,3 +443,45 @@ test "entry list caps displayed rows" {
     try std.testing.expectEqual(app_controller.max_entry_rows_pub, ctrl.entry_row_count);
     try std.testing.expectEqual(@as(usize, 1), ctrl.tree_row_count);
 }
+
+test "entry select keeps listing folder; tree arrows move from that folder" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    defer ctrl.deinit();
+    ctrl.setPasswordText("test-password-123");
+    ctrl.slots.confirm_password_mode = 1;
+    ctrl.setConfirmText("test-password-123");
+    ctrl.createVault();
+
+    ctrl.addCollection();
+    const first_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    ctrl.selected_id = null;
+    ctrl.addCollection();
+    const second_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    ctrl.selected_id = null;
+    ctrl.addCollection();
+    const third_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!std.mem.eql(u8, &first_id, &third_id));
+    try std.testing.expectEqual(@as(usize, 3), ctrl.tree_row_count);
+
+    ctrl.selectNode(third_id);
+    ctrl.addEntry();
+    try std.testing.expect(ctrl.hasSelectedEntry());
+    try std.testing.expectEqual(@as(usize, 1), ctrl.entry_row_count);
+    ctrl.selectEntryAt(0);
+
+    const listing = ctrl.listingCollectionId() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &third_id, &listing);
+    try std.testing.expect(ctrl.findTreeIndex(ctrl.selected_id.?) == null);
+    try std.testing.expectEqual(@as(usize, 2), ctrl.findTreeIndex(listing).?);
+
+    ctrl.moveTreeSelection(-1);
+    try std.testing.expectEqualSlices(u8, &second_id, &(ctrl.selected_id orelse return error.TestUnexpectedResult));
+    try std.testing.expect(ctrl.hasSelectedCollection());
+}
