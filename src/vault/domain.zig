@@ -1236,3 +1236,24 @@ test "secrets gate set verify and secret roundtrip" {
     try std.testing.expectEqualStrings("s3cret", secret.password);
     try std.testing.expectEqualStrings("note", secret.notes);
 }
+
+test "ingestUrls groups by host and dedupes" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc);
+    defer store.deinit();
+    const sample =
+        \\https://simpcity.cr/threads/ashley-alban.9988/page-2?order=reaction_score
+        \\https://bunkr.pk/f/ZqgFmEqdng4QV
+        \\https://bunkr.pk/f/ZqgFmEqdng4QV
+        \\https://cyberfile.me/folder/83a8f2407979ea70afc06e2414bc3a47/Ashley_Alban_2024
+    ;
+    const result = try store.ingestUrls(sample, 1000);
+    try std.testing.expectEqual(@as(u32, 3), result.created);
+    try std.testing.expectEqual(@as(u32, 1), result.skipped_dup);
+    try std.testing.expectEqual(@as(u32, 0), result.invalid);
+
+    var hosts = [_][]const u8{ "simpcity.cr", "bunkr.pk", "cyberfile.me" };
+    for (hosts) |host| {
+        try std.testing.expect(store.findCollectionByNameUnderParent(root_parent, host) != null);
+    }
+}
