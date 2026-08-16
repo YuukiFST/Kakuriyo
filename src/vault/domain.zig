@@ -25,6 +25,7 @@ pub const DomainError = error{
     Corrupt,
     UnsupportedVersion,
     OutOfMemory,
+    WeakPassword,
 };
 
 pub const Uuid = [uuid_len]u8;
@@ -53,10 +54,51 @@ pub const Node = union(Kind) {
     entry: Entry,
 };
 
+pub const SecretsGate = union(enum) {
+    unset,
+    set: struct {
+        salt: [16]u8,
+        t_cost: u32,
+        m_cost: u32,
+        p_cost: u32,
+        hash: [32]u8,
+    },
+};
+
+pub const Secret = struct {
+    id: Uuid,
+    label: []const u8,
+    username: []const u8,
+    password: []const u8,
+    notes: []const u8,
+    created_ms: u64,
+    updated_ms: u64,
+};
+
+pub const senhas_gate_t_cost: u32 = 1;
+pub const senhas_gate_m_cost: u32 = 8 * 1024;
+pub const senhas_gate_p_cost: u32 = 1;
+
+pub fn passwordMeetsSenhasPolicy(pw: []const u8) bool {
+    var has_upper = false;
+    var has_lower = false;
+    var has_digit = false;
+    var has_special = false;
+    for (pw) |ch| {
+        if (std.ascii.isUpper(ch)) has_upper = true;
+        if (std.ascii.isLower(ch)) has_lower = true;
+        if (std.ascii.isDigit(ch)) has_digit = true;
+        if (!std.ascii.isAlphanumeric(ch)) has_special = true;
+    }
+    return has_upper and has_lower and has_digit and has_special;
+}
+
 /// In-memory vault contents. Owns all string storage.
 pub const Store = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayListUnmanaged(Node) = .empty,
+    secrets_gate: SecretsGate = .unset,
+    secrets: std.ArrayListUnmanaged(Secret) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -78,6 +120,14 @@ pub const Store = struct {
                 },
             }
         }
+        for (self.secrets.items) |*s| {
+            self.allocator.free(s.label);
+            self.allocator.free(s.username);
+            std.crypto.secureZero(u8, @constCast(s.password));
+            self.allocator.free(s.password);
+            self.allocator.free(s.notes);
+        }
+        self.secrets.deinit(self.allocator);
         self.nodes.deinit(self.allocator);
         self.* = undefined;
     }
@@ -572,6 +622,152 @@ pub const Store = struct {
         entry.updated_ms = updated_ms;
     }
 
+    fn hashSenhasGate(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        password: []const u8,
+        salt: *const [16]u8,
+        t_cost: u32,
+        m_cost: u32,
+        p_cost: u32,
+        out_hash: *[32]u8,
+    ) DomainError!void {
+        std.crypto.pwhash.argon2.kdf(
+            allocator,
+            out_hash,
+            password,
+            salt,
+            std.crypto.pwhash.argon2.Params{ .t = @intCast(t_cost), .m = @intCast(m_cost), .p = @intCast(p_cost) },
+            .argon2id,
+            io,
+        ) catch return error.OutOfMemory;
+    }
+
+    pub fn setSecretsGateFromPassword(self: *Store, io: std.Io, password: []const u8) DomainError!void {
+        if (!passwordMeetsSenhasPolicy(password)) return error.WeakPassword;
+        var salt: [16]u8 = undefined;
+        io.random(&salt);
+        var hash: [32]u8 = undefined;
+        try hashSenhasGate(
+            self.allocator,
+            io,
+            password,
+            &salt,
+            senhas_gate_t_cost,
+            senhas_gate_m_cost,
+            senhas_gate_p_cost,
+            &hash,
+        );
+        self.secrets_gate = .{ .set = .{
+            .salt = salt,
+            .t_cost = senhas_gate_t_cost,
+            .m_cost = senhas_gate_m_cost,
+            .p_cost = senhas_gate_p_cost,
+            .hash = hash,
+        } };
+    }
+
+    pub fn verifySecretsGate(self: *const Store, io: std.Io, password: []const u8) bool {
+        const gate = switch (self.secrets_gate) {
+            .unset => return false,
+            .set => |g| g,
+        };
+        var hash: [32]u8 = undefined;
+        hashSenhasGate(
+            self.allocator,
+            io,
+            password,
+            &gate.salt,
+            gate.t_cost,
+            gate.m_cost,
+            gate.p_cost,
+            &hash,
+        ) catch return false;
+        return std.crypto.timing_safe.eql([32]u8, hash, gate.hash);
+    }
+
+    pub fn addSecret(
+        self: *Store,
+        label: []const u8,
+        username: []const u8,
+        password: []const u8,
+        notes: []const u8,
+        now_ms: u64,
+    ) DomainError!Uuid {
+        const id = newUuid();
+        const owned_label = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(owned_label);
+        const owned_user = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(owned_user);
+        const owned_pass = try self.allocator.dupe(u8, password);
+        errdefer self.allocator.free(owned_pass);
+        const owned_notes = try self.allocator.dupe(u8, notes);
+        errdefer self.allocator.free(owned_notes);
+        try self.secrets.append(self.allocator, .{
+            .id = id,
+            .label = owned_label,
+            .username = owned_user,
+            .password = owned_pass,
+            .notes = owned_notes,
+            .created_ms = now_ms,
+            .updated_ms = now_ms,
+        });
+        return id;
+    }
+
+    pub fn getSecret(self: *const Store, id: Uuid) ?*const Secret {
+        for (self.secrets.items) |*s| {
+            if (std.mem.eql(u8, &s.id, &id)) return s;
+        }
+        return null;
+    }
+
+    pub fn updateSecret(
+        self: *Store,
+        id: Uuid,
+        label: []const u8,
+        username: []const u8,
+        password: []const u8,
+        notes: []const u8,
+        now_ms: u64,
+    ) DomainError!void {
+        const secret = for (self.secrets.items) |*s| {
+            if (std.mem.eql(u8, &s.id, &id)) break s;
+        } else return error.NotFound;
+        const owned_label = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(owned_label);
+        const owned_user = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(owned_user);
+        const owned_pass = try self.allocator.dupe(u8, password);
+        errdefer self.allocator.free(owned_pass);
+        const owned_notes = try self.allocator.dupe(u8, notes);
+        errdefer self.allocator.free(owned_notes);
+        self.allocator.free(secret.label);
+        self.allocator.free(secret.username);
+        std.crypto.secureZero(u8, @constCast(secret.password));
+        self.allocator.free(secret.password);
+        self.allocator.free(secret.notes);
+        secret.label = owned_label;
+        secret.username = owned_user;
+        secret.password = owned_pass;
+        secret.notes = owned_notes;
+        secret.updated_ms = now_ms;
+    }
+
+    pub fn deleteSecret(self: *Store, id: Uuid) DomainError!void {
+        for (self.secrets.items, 0..) |s, i| {
+            if (!std.mem.eql(u8, &s.id, &id)) continue;
+            self.allocator.free(s.label);
+            self.allocator.free(s.username);
+            std.crypto.secureZero(u8, @constCast(s.password));
+            self.allocator.free(s.password);
+            self.allocator.free(s.notes);
+            _ = self.secrets.swapRemove(i);
+            return;
+        }
+        return error.NotFound;
+    }
+
     pub fn encode(self: *const Store, allocator: std.mem.Allocator) DomainError![]u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -586,6 +782,20 @@ pub const Store = struct {
                 .entry => |e| try writeEntry(allocator, &out, e),
             }
         }
+
+        switch (self.secrets_gate) {
+            .unset => try out.append(allocator, 0),
+            .set => |g| {
+                try out.append(allocator, 1);
+                try out.appendSlice(allocator, &g.salt);
+                try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u32, g.t_cost)));
+                try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u32, g.m_cost)));
+                try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u32, g.p_cost)));
+                try out.appendSlice(allocator, &g.hash);
+            },
+        }
+        try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u32, @intCast(self.secrets.items.len))));
+        for (self.secrets.items) |s| try writeSecret(allocator, &out, s);
 
         return try out.toOwnedSlice(allocator);
     }
@@ -610,6 +820,12 @@ pub const Store = struct {
                 .entry => off = try readEntry(allocator, &store, bytes, off, ver),
             }
         }
+        if (ver < version) {
+            if (off != bytes.len) return error.Corrupt;
+            return store;
+        }
+        if (off == bytes.len) return store;
+        off = try readSecretsTrailer(allocator, &store, bytes, off);
         if (off != bytes.len) return error.Corrupt;
         return store;
     }
@@ -634,6 +850,81 @@ fn writeEntry(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), e:
     try writeBytes(allocator, out, e.preview_image);
     try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u64, e.created_ms)));
     try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u64, e.updated_ms)));
+}
+
+fn writeSecret(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: Secret) DomainError!void {
+    try out.appendSlice(allocator, &s.id);
+    try writeBytes(allocator, out, s.label);
+    try writeBytes(allocator, out, s.username);
+    try writeBytes(allocator, out, s.password);
+    try writeBytes(allocator, out, s.notes);
+    try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u64, s.created_ms)));
+    try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToBig(u64, s.updated_ms)));
+}
+
+fn readSecretsTrailer(allocator: std.mem.Allocator, store: *Store, bytes: []const u8, start: usize) DomainError!usize {
+    if (start >= bytes.len) return error.Corrupt;
+    var off = start;
+    const tag = bytes[off];
+    off += 1;
+    switch (tag) {
+        0 => store.secrets_gate = .unset,
+        1 => {
+            if (off + 16 + 12 + 32 > bytes.len) return error.Corrupt;
+            var salt: [16]u8 = undefined;
+            @memcpy(&salt, bytes[off .. off + 16]);
+            off += 16;
+            const t_cost = std.mem.readInt(u32, bytes[off..][0..4], .big);
+            off += 4;
+            const m_cost = std.mem.readInt(u32, bytes[off..][0..4], .big);
+            off += 4;
+            const p_cost = std.mem.readInt(u32, bytes[off..][0..4], .big);
+            off += 4;
+            var hash: [32]u8 = undefined;
+            @memcpy(&hash, bytes[off .. off + 32]);
+            off += 32;
+            store.secrets_gate = .{ .set = .{
+                .salt = salt,
+                .t_cost = t_cost,
+                .m_cost = m_cost,
+                .p_cost = p_cost,
+                .hash = hash,
+            } };
+        },
+        else => return error.Corrupt,
+    }
+    if (off + 4 > bytes.len) return error.Corrupt;
+    const count = std.mem.readInt(u32, bytes[off..][0..4], .big);
+    off += 4;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (off + uuid_len > bytes.len) return error.Corrupt;
+        var id: Uuid = undefined;
+        @memcpy(&id, bytes[off .. off + uuid_len]);
+        off += uuid_len;
+        const label = try readBytes(allocator, bytes, off);
+        off = label[1];
+        const username = try readBytes(allocator, bytes, off);
+        off = username[1];
+        const password = try readBytes(allocator, bytes, off);
+        off = password[1];
+        const notes = try readBytes(allocator, bytes, off);
+        off = notes[1];
+        if (off + 16 > bytes.len) return error.Corrupt;
+        const created_ms = std.mem.readInt(u64, bytes[off..][0..8], .big);
+        const updated_ms = std.mem.readInt(u64, bytes[off + 8 ..][0..8], .big);
+        off += 16;
+        try store.secrets.append(store.allocator, .{
+            .id = id,
+            .label = label[0],
+            .username = username[0],
+            .password = password[0],
+            .notes = notes[0],
+            .created_ms = created_ms,
+            .updated_ms = updated_ms,
+        });
+    }
+    return off;
 }
 
 fn writeBytes(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), slice: []const u8) DomainError!void {
@@ -914,4 +1205,34 @@ test "entry preview_image roundtrip kdat v3" {
     try std.testing.expectEqualStrings("JPEGDATA", e.preview_image);
     try std.testing.expectEqualStrings("T", e.preview_title);
     try std.testing.expectEqualStrings("D", e.preview_description);
+}
+
+test "senhas policy requires four classes" {
+    try std.testing.expect(!passwordMeetsSenhasPolicy("password"));
+    try std.testing.expect(!passwordMeetsSenhasPolicy("Password1"));
+    try std.testing.expect(passwordMeetsSenhasPolicy("Password1!"));
+}
+
+test "secrets gate set verify and secret roundtrip" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var store = Store.init(alloc);
+    defer store.deinit();
+
+    try std.testing.expectError(error.WeakPassword, store.setSecretsGateFromPassword(io, "Password1"));
+    try store.setSecretsGateFromPassword(io, "Password1!");
+    try std.testing.expect(store.verifySecretsGate(io, "Password1!"));
+    try std.testing.expect(!store.verifySecretsGate(io, "WrongPass1!"));
+
+    const sid = try store.addSecret("Bank", "alice", "s3cret", "note", 10);
+    const encoded = try store.encode(alloc);
+    defer alloc.free(encoded);
+    var decoded = try Store.decode(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expect(decoded.verifySecretsGate(io, "Password1!"));
+    const secret = decoded.getSecret(sid).?;
+    try std.testing.expectEqualStrings("Bank", secret.label);
+    try std.testing.expectEqualStrings("alice", secret.username);
+    try std.testing.expectEqualStrings("s3cret", secret.password);
+    try std.testing.expectEqualStrings("note", secret.notes);
 }
