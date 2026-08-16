@@ -1,74 +1,42 @@
 # Kakuriyo
 
-Local encrypted personal vault for private Entries (links and other text),
-organized in nested Collections. Desktop-only, offline-first, no telemetry.
+Local encrypted personal vault: **Links** (bulk URL ingest + cached preview)
+and **Senhas** (second gate + secrets). Desktop-only, offline-first, no telemetry.
 
-**Status:** vault v1 envelope closed in Zig (crypto + host dispatch + gates).
-Session UI (unlock/save/lock screens) waits on the SDK compiled-TS lane fix.
-Canonical tracker: [GitHub Issues](https://github.com/YuukiFST/Kakuriyo/issues).
-Plan: [vault-v1 envelope](docs/superpowers/plans/2026-08-09-vault-v1-envelope.md).
+Vault envelope is Zig (Argon2id + XChaCha20-Poly1305). Session UI is Zig
+`AppController` + `app_view.zig`. `src/core.ts` holds number slots only.
 
-The tree below is the Native SDK scaffold (`native init`), modified:
-
-A native app authored in TypeScript and markup: the logic lives in
-`src/core.ts` (Model, Msg, update - the app-core subset, compiled to
-native code at build time; no JS runtime ships in the binary) and the
-view in `src/app.native`. There is no Zig in this tree and nothing to
-configure: the build detects `src/core.ts` and wires everything.
-
-## The loop
+## Run
 
 ```sh
-native dev --core   # fastest: run the core's logic under node -
-                    # dispatch messages as JSON lines, watch the model
-                    # and effect transcript (not a renderer)
-native dev          # build and run the real app (markup hot reload)
-native check        # verify core.ts (subset checker) + markup + app.zon
-native build        # ReleaseFast binary in zig-out/bin/
-native test         # the app's test suite
+./run.sh    # or: npm start
 ```
 
-Edit `src/core.ts` for behavior, `src/app.native` for the view, and
-`app.zon` for windows/identity/permissions. Markup binds the model's
-field names exactly as core.ts wrote them (`tickCount` -> `{tickCount}`),
-and exported single-model helpers bind as derived values (`{total}`).
+Enters `nix-shell` when needed, builds Debug, opens the GTK window.
+Needs `DISPLAY` / `WAYLAND_DISPLAY` and `native` on PATH.
+
+## Flows
+
+1. **Master** — first launch: password + confirm (min 8). Later: unlock with master only.
+2. **Links** — paste `http(s)://` URLs, **Ingerir**. Collections group by host (`www.` stripped). Select an entry: preview title/description/thumbnail come from vault cache (no network). **Refresh** fetches with an 800ms budget; images over 128 KiB are dropped.
+3. **Senhas** — first visit: create a gate password (uppercase + lowercase + digit + special). Later visits in the same master session stay unlocked if you already opened Senhas; **Lock** (or process exit) clears the Senhas session. Secrets: label, username, password, notes. Secret values are not required to match the gate policy.
+4. **Lock** — saves dirty entry if needed, drops the DEK, drops Senhas gate unlock.
 
 ## Gates
 
-One command runs every oracle (contract check, effects seam, vault crypto,
-fmt, smoke, mutation):
-
 ```sh
-# first time after clone
 npm install
 npm install --prefix vendor/native-sdk/packages/core
 nix-shell --run "npm run gate"
 ```
 
-CI runs the same script. See [GATES.md](GATES.md) for the gate table and
-mutation dispositions.
+See [GATES.md](GATES.md).
 
-## Try the core loop
+## Editor / build notes
 
-```sh
-printf '%s\n' '{"kind":"increment"}' '{"kind":"toggle_ticking"}' '{"advance":3000}' | native dev --core
-```
-
-## Editor support
-
-Stock editor TypeScript just works: `package.json` and `tsconfig.json`
-are the editor-and-versioning surface (the tsconfig mirrors the checker's
-own options, so editor errors match `native check`), and
-`node_modules/@native-sdk/core` is a CLI-managed copy of the SDK package
-so `@native-sdk/core` resolves with full IntelliSense. Builds never read
-any of it — delete node_modules and every `native` verb still works; the
-next `native check`/`dev`/`build` puts it back. Running `npm install`
-is optional for the same reason: the CLI materializes and refreshes the
-package itself, and an install simply lands the identical content once
-`@native-sdk/core` is on npm.
+`package.json` and `tsconfig.json` are the editor TypeScript surface.
+`src/app.native` is a placeholder; paint lives in `src/app_runner/app_view.zig`.
 
 ## Requirements
 
-Node.js 22.15+ (on the 23 line: 23.5+) on PATH (the TypeScript frontend
-and the core compiler run at build time; your shipped binary carries
-none of it).
+Node.js 22.15+ (on the 23 line: 23.5+) on PATH. Zig comes from `nix-shell`.

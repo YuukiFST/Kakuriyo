@@ -50,7 +50,7 @@
 - Consumes: existing `Entry`, `Store.encode`/`decode`, `version` (=2 today)
 - Produces: `version = 3`; `Entry.preview_image: []u8`; encode/decode roundtrip; v2 decode migrates empty image
 
-- [ ] **Step 1: Write failing test** for entry with preview image roundtrip
+- [x] **Step 1: Write failing test** for entry with preview image roundtrip
 
 ```zig
 test "entry preview_image roundtrip kdat v3" {
@@ -70,7 +70,7 @@ test "entry preview_image roundtrip kdat v3" {
 
 (Adapt helper names to match existing `addEntry` / update APIs — prefer extending existing methods rather than inventing parallel ones.)
 
-- [ ] **Step 2: Run test — expect FAIL**
+- [x] **Step 2: Run test — expect FAIL**
 
 ```bash
 cd /mnt/Others/Projects/PersonalProjects/Kakuriyo
@@ -79,7 +79,7 @@ nix-shell --run "zig build test-vault"
 
 Expected: compile or assertion failure around `preview_image` / version.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 - Bump `pub const version: u32 = 3;` keep `version_v2 = 2` (and v1) for decode.
 - Add `preview_image: []u8 = ""` on `Entry`; free in `deinit` / `deleteEntry`.
@@ -87,9 +87,9 @@ Expected: compile or assertion failure around `preview_image` / version.
 - On decode v1/v2: set `preview_image` empty.
 - Add `setPreview(self, id, title, description, image_bytes)` that owns duped slices.
 
-- [ ] **Step 4: Re-run `zig build test-vault` — PASS** (existing tests still green)
+- [x] **Step 4: Re-run `zig build test-vault` — PASS** (existing tests still green)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/vault/domain.zig src/vault/tests.zig
@@ -120,7 +120,7 @@ Use lighter Argon2id params for gate than vault envelope if needed for UI snappi
 
 Encode after nodes: `u8 gate_tag` (0 unset / 1 set) + fields; `u32be secret_count` + secrets. v1/v2 decode → gate unset, zero secrets.
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```zig
 test "senhas policy requires four classes" {
@@ -134,10 +134,10 @@ test "secrets gate set verify and secret roundtrip" {
 }
 ```
 
-- [ ] **Step 2: Run — FAIL**
-- [ ] **Step 3: Implement codec + helpers**
-- [ ] **Step 4: `nix-shell --run "zig build test-vault"` PASS**
-- [ ] **Step 5: Commit** `feat(domain): secrets gate verifier and secret list in KDAT`
+- [x] **Step 2: Run — FAIL**
+- [x] **Step 3: Implement codec + helpers**
+- [x] **Step 4: `nix-shell --run "zig build test-vault"` PASS**
+- [x] **Step 5: Commit** `feat(domain): secrets gate verifier and secret list in KDAT`
 
 ---
 
@@ -155,7 +155,7 @@ test "secrets gate set verify and secret roundtrip" {
   - Scan text for `http://` / `https://` URLs (whitespace/newline separated; also tolerate bare lines)
   - For each URL: host collection under root (create if missing, name = normalized host); if entry with same `url` exists anywhere → `skipped_dup`; else `addEntry` with title = path tail or full URL truncated
 
-- [ ] **Step 1: Failing test** with the user’s example multi-line paste (at least 3 distinct hosts: `simpcity.cr`, `bunkr.cr`/`bunkr.pk`, `cyberfile.me`)
+- [x] **Step 1: Failing test** with the user’s example multi-line paste (at least 3 distinct hosts: `simpcity.cr`, `bunkr.cr`/`bunkr.pk`, `cyberfile.me`)
 
 ```zig
 test "ingestUrls groups by host and dedupes" {
@@ -170,8 +170,8 @@ test "ingestUrls groups by host and dedupes" {
 }
 ```
 
-- [ ] **Step 2–4: TDD implement + `test-vault` PASS**
-- [ ] **Step 5: Commit** `feat(domain): bulk URL ingest grouped by host`
+- [x] **Step 2–4: TDD implement + `test-vault` PASS**
+- [x] **Step 5: Commit** `feat(domain): bulk URL ingest grouped by host`
 
 ---
 
@@ -189,9 +189,9 @@ test "ingestUrls groups by host and dedupes" {
 - Image step: if `image_url` present, GET bytes; if `len <= max_image_bytes` keep; else discard image
 - Select path never calls fetch — document in comment
 
-- [ ] **Step 1: Unit test** `parseHtml` extracts og:image from fixture string
-- [ ] **Step 2–4: Implement + tests PASS**
-- [ ] **Step 5: Commit** `feat(preview): og:image parse and capped image bytes`
+- [x] **Step 1: Unit test** `parseHtml` extracts og:image from fixture string
+- [x] **Step 2–4: Implement + tests PASS**
+- [x] **Step 5: Commit** `feat(preview): og:image parse and capped image bytes`
 
 ---
 
@@ -216,9 +216,9 @@ test "ingestUrls groups by host and dedupes" {
 
 Msgs to add in `core.ts` + dispatch: `ingest_press`, `paste_input`, `senhas_gate_create`, `senhas_gate_unlock`, `secret_add`, `secret_save`, `secret_delete`, `activity_tab` values 0|1 only.
 
-- [ ] **Step 1: Controller unit tests** for create vault → ingest → host collections; senhas gate weak reject; lock clears gate flag
-- [ ] **Step 2–4: Implement + `nix-shell --run "zig build test -Dplatform=null"` PASS**
-- [ ] **Step 5: Commit** `feat(app): links ingest and senhas gate session in controller`
+- [x] **Step 1: Controller unit tests** for create vault → ingest → host collections; senhas gate weak reject; lock clears gate flag
+- [x] **Step 2–4: Implement + `nix-shell --run "zig build test -Dplatform=null"` PASS**
+- [x] **Step 5: Commit** `feat(app): links ingest and senhas gate session in controller`
 
 ---
 
@@ -238,10 +238,10 @@ Msgs to add in `core.ts` + dispatch: `ingest_press`, `paste_input`, `senhas_gate
 
 Keep TRUE BLACK / existing token style if present; avoid purple-on-white. One clear composition per screen.
 
-- [ ] **Step 1: Implement view branches** driven by `phase` + `activity` + `senhas_gate_state`
-- [ ] **Step 2: `nix-shell --run "native check --strict"`** (or gate-check script) PASS
-- [ ] **Step 3: Manual `./run.sh` smoke if DISPLAY available** — auth screens render
-- [ ] **Step 4: Commit** `feat(ui): auth links senhas shells`
+- [x] **Step 1: Implement view branches** driven by `phase` + `activity` + `senhas_gate_state`
+- [x] **Step 2: `nix-shell --run "native check --strict"`** (or gate-check script) PASS
+- [x] **Step 3: Manual `./run.sh` smoke if DISPLAY available** — auth screens render
+- [x] **Step 4: Commit** `feat(ui): auth links senhas shells`
 
 ---
 
@@ -255,9 +255,9 @@ Keep TRUE BLACK / existing token style if present; avoid purple-on-white. One cl
 - `refresh_preview` / after ingest: call preview fetch with budget; `store.setPreview`; mark dirty; save when existing save path runs
 - Select path oracle: fill Entry with preview fields; call select; assert view model / controller preview getters return cached data; assert test does not invoke network (inject null transport or flag)
 
-- [ ] **Step 1: Test** `select uses cache without fetch`
-- [ ] **Step 2–4: Implement + PASS**
-- [ ] **Step 5: Commit** `feat(preview): cache-first select and budgeted refresh`
+- [x] **Step 1: Test** `select uses cache without fetch`
+- [x] **Step 2–4: Implement + PASS**
+- [x] **Step 5: Commit** `feat(preview): cache-first select and budgeted refresh`
 
 ---
 
@@ -273,9 +273,9 @@ Keep TRUE BLACK / existing token style if present; avoid purple-on-white. One cl
   5. senhas gate create/unlock/secret CRUD
   6. lock clears gate session
 
-- [ ] **Step 1: Add smoke steps that exit non-zero on failure**
-- [ ] **Step 2: Wire into `npm run gate`**
-- [ ] **Step 3: Run full gate**
+- [x] **Step 1: Add smoke steps that exit non-zero on failure**
+- [x] **Step 2: Wire into `npm run gate`**
+- [x] **Step 3: Run full gate**
 
 ```bash
 cd /mnt/Others/Projects/PersonalProjects/Kakuriyo
@@ -284,7 +284,7 @@ nix-shell --run "npm run gate"
 
 Expected: all PASS.
 
-- [ ] **Step 4: Commit** `test: gates and smoke for ui redesign flows`
+- [x] **Step 4: Commit** `test: gates and smoke for ui redesign flows`
 
 ---
 
@@ -294,16 +294,16 @@ Expected: all PASS.
 - Modify: `README.md` (how to run, master/Senhas/Links flows)
 - Update plan checkboxes as done
 
-- [ ] **Step 1: Dogfood checklist (real binary if display; else headless smoke evidence)**
-  - [ ] Create master with confirm
-  - [ ] Unlock
-  - [ ] Paste multi-URL sample from spec → host collections appear
-  - [ ] Select entry → preview meta/thumb cache path works
-  - [ ] Senhas first visit → weak password rejected; strong accepted
-  - [ ] Add secret; lock; unlock master; Senhas requires gate again
-- [ ] **Step 2: README update**
-- [ ] **Step 3: Final `nix-shell --run "npm run gate"` PASS**
-- [ ] **Step 4: Commit** `docs: README for redesigned vault UI`
+- [x] **Step 1: Dogfood checklist (real binary if display; else headless smoke evidence)**
+  - [x] Create master with confirm
+  - [x] Unlock
+  - [x] Paste multi-URL sample from spec → host collections appear
+  - [x] Select entry → preview meta/thumb cache path works
+  - [x] Senhas first visit → weak password rejected; strong accepted
+  - [x] Add secret; lock; unlock master; Senhas requires gate again
+- [x] **Step 2: README update**
+- [x] **Step 3: Final `nix-shell --run "npm run gate"` PASS**
+- [x] **Step 4: Commit** `docs: README for redesigned vault UI`
 - [ ] **Step 5: Push branch, open PR, merge**
 
 ```bash
