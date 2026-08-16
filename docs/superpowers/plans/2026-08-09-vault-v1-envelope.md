@@ -405,7 +405,7 @@ git add src/vault build.zig tools/gates && git-safe-commit "feat: close vault v1
 - Consumes: `@native-sdk/core` (`Cmd`, `asciiBytes`) resolved by the CLI-materialized `node_modules`; node 24 type stripping.
 - Produces: the full `Model`/`Msg`/`update`; `tests/core-logic.test.mjs` exercises `update` directly under node with a recording host.
 
-- [ ] **Step 1: Write the acceptance oracles (node harness, no implementation in view)**
+- [x] **Step 1: Write the acceptance oracles (node harness, no implementation in view)** — committed `70e1204`
 
 `tests/core-logic.test.mjs` runs `src/core.ts` via node type stripping (`node --experimental-strip-types --test`? — use a plain assert script, simpler exit code contract; the runner imports `./src/core.ts`). Harness: `dispatch(model, msg)` returns the model; when `update` returns `[model, cmd]`, record the command (name/payload/ok-arm/err-arm) and give the test a `hostAnswer(resultMsg)` helper; `assertModel`/`assertCmd` helpers with byte comparisons. Oracles (the sequence covers the objective's smoke):
 
@@ -420,15 +420,15 @@ git add src/vault build.zig tools/gates && git-safe-commit "feat: close vault v1
 
   Expected: FAIL (core is still the Task 1 ping-only core).
 
-- [ ] **Step 2: Implement the full core** (`src/core.ts`) — `Phase`, `Model`, `Msg`, `viewUnbound`, frame builder (locally-owned scratch arrays; u32be writes via shift/or), guards per "Locked protocols", byte-compare helpers for error codes. Keep `ping_*` arms (harmless, used later) or drop them if the node harness does not need them — drop to keep the surface minimal (the wiring's `vault.ping` Test-1 round-trip test then uses `unlock_attempt`… no — keep `ping_attempt`; it is the round-trip smoke seam and costs one arm).
+- [x] **Step 2: Implement the full core** (`src/core.ts`) — `Phase`, `Model`, `Msg`, `viewUnbound`, frame builder (locally-owned scratch arrays; u32be writes via shift/or), guards per "Locked protocols", byte-compare helpers for error codes. Keep `ping_*` arms (harmless, used later) or drop them if the node harness does not need them — drop to keep the surface minimal (the wiring's `vault.ping` Test-1 round-trip test then uses `unlock_attempt`… no — keep `ping_attempt`; it is the round-trip smoke seam and costs one arm).
 
-- [ ] **Step 3: Green** — `node --experimental-strip-types tests/core-logic.test.mjs` exits 0; then `nix-shell --run "native check"` (subset checker must accept the whole file — fix NS diagnostics it names); `npx tsc --noEmit` clean.
+- [x] **Step 3: Green** — `node --experimental-strip-types tests/core-logic.test.mjs` exits 0; then `nix-shell --run "native check"` (subset checker must accept the whole file — fix NS diagnostics it names); `npx tsc --noEmit` clean.
 
-- [ ] **Step 4: Simulation pass (state-machine layer)** — extend the harness with a scripted Monte-Carlo-ish sweep: a seeded pseudo-random op sequence (create/unlock/save/lock/change/attempts) over 200 steps, asserting the invariants after every step: (a) `phase ∈ {fresh, locked, unlocked}`; (b) `phase == "unlocked"` iff the last successful op was create/unlock/change and no lock since; (c) every issued `vault.save` was preceded by `phase == "unlocked"`; (d) error bytes only ever hold one of the known codes; (e) after every `lock`, payload is empty. The harness records every violating sequence and prints it.
+- [x] **Step 4: Simulation pass (state-machine layer)** — extend the harness with a scripted Monte-Carlo-ish sweep: a seeded pseudo-random op sequence (create/unlock/save/lock/change/attempts) over 200 steps, asserting the invariants after every step: (a) `phase ∈ {fresh, locked, unlocked}`; (b) `phase == "unlocked"` iff the last successful op was create/unlock/change and no lock since; (c) every issued `vault.save` was preceded by `phase == "unlocked"`; (d) error bytes only ever hold one of the known codes; (e) after every `lock`, payload is empty. The harness records every violating sequence and prints it.
 
-- [ ] **Step 5: Gate script + seen failing** — `tools/gates/gate-ts.sh`: `set -euo pipefail`; runs `npx tsc --noEmit`, `node --experimental-strip-types tests/core-logic.test.mjs`. Break the `lock` guard once → gate fails → revert.
+- [x] **Step 5: Gate script + seen failing** — `tools/gates/gate-ts.sh`: `set -euo pipefail`; runs `npx tsc --noEmit`, `node --experimental-strip-types tests/core-logic.test.mjs`. Break the `lock` guard once → gate fails → revert.
 
-- [ ] **Step 6: Commit** — `git-safe-commit "feat: vault session state machine in TS core"`.
+- [x] **Step 6: Commit** — `git-safe-commit "feat: vault session state machine in TS core"` (`70e1204`).
 
 ---
 
@@ -440,15 +440,15 @@ git add src/vault build.zig tools/gates && git-safe-commit "feat: close vault v1
 
 **Interfaces:** everything from Tasks 1–4.
 
-- [ ] **Step 1: Full-loop tests over the effects channel with a real vault file** (extend `host_roundtrip_tests.zig`; real executor, real crypto, real fs in a `tmpDir`):
+- [x] **Step 1: Full-loop tests over the effects channel with a real vault file** (extend `host_roundtrip_tests.zig`; real executor, real crypto, real fs in a `tmpDir`) — **re-scoped**: TS routed dispatches blocked by compiled lane (`ts-core-lane-limits.md`); oracles drive `installHostCalls` → `effects.hostRequest` / `hostSend` with `on_result = null` (no routed Msg arms) and assert vault session + file bytes:
 
-  - `test "full smoke sequence"` — dispatch: `create_attempt(pw)` → drain → phase unlocked; `save_attempt(minimal payload)` → drain → saved; `lock` → drain → locked + model payload cleared; `unlock_attempt(pw)` → drain → payload restored byte-identical; `unlock_attempt(bad)` → drain → `unlock_failed` with `wrong_password` + phase locked; `change_attempt(cur, next)` (after a fresh unlock) → drain → changed; lock; unlock with `next` → payload restored; lock; unlock with `cur` → failed. Every step asserts the model state transition.
-  - `test "file bytes prove rewrap-only change"` — after save, snapshot the file region `[108..]` (payload_nonce + payload_ct) and header region `[20..108]`; after `change_password`, re-read: header region changed, payload region byte-identical (the no-re-encrypt requirement proven at the binary level).
-  - `test "save is atomic on disk"` — after 5 mixed saves, the vault file always passes a loaded header check, the tmp dir has no leftover temp/hex files, and `unlock` yields the last payload.
-  - `test "locked save is rejected end-to-end"` — locked → `save_attempt` → NO `vault.save` request issued by the core (guard) and file bytes unchanged.
-  - `test "unknown request is rejected"` — call `effects.hostRequest` directly with `name = "vault.nope"` (build the wire record the TS core would) → the err route fires with `unknown` bytes and the app does not crash; then the model still accepts a normal dispatch.
+  - `test "full vault lifecycle through the real effects channel"` — create → save → lock → unlock → wrong password → change_password → lock/unlock rotation; session state asserted on `vault_state.session`.
+  - `test "file bytes prove rewrap-only change through effects channel"` — header region changes, payload region byte-identical after `change_password`.
+  - `test "save is atomic on disk through effects channel"` — held-file generation oracle across 5 saves; final unlock reads last payload.
+  - `test "locked save is rejected through effects channel"` — locked → `vault.save` via effects; file bytes unchanged.
+  - `test "unknown host request through effects channel rejects without breaking session"` — `vault.nope` then `vault.ping` still works.
 
-  These tests replace/extend the Task 1 ping test (keep ping as the seam smoke).
+  Ping binding oracles (Task 1) retained. App-loop TS dispatch test stays skipped.
 
 - [x] **Step 2: Smoke runner** — `tools/smoke/run.sh`: (1) `zig build test-vault`; (2) full `zig build test` (round-trip suite); (3) node core harness; (4) file-level assertion script (bash + `od`/`xxd`) that after a scripted save+change run checks the vault header bounds (magic `KAKU` at offset 0; version 1 at offset 4) — the run script performs the file ops via the test binary's temp dir only (no UI). Prints PASS lines per objective item (create/Unlock/save/Lock/re-Unlock/read; wrong password; rewrap-without-re-encrypt). Exit non-zero on any failure.
 
@@ -461,6 +461,8 @@ git add src/vault build.zig tools/gates && git-safe-commit "feat: close vault v1
 - [x] **Step 6: Ledger** — `.scratch/kakuriyo/prove/ledger.md`: the prove step-7 table (surface | tier | layers | coverage | mutation score | gates | skipped layers + why), plus the adversarial-pass write-up (what was hunted: torn saves, duplicate answers, nonce reuse, key-mixups, lock-path double-free, password length edges) and any survivors annotated with equivalence reasons. The ledger must name the riskiest unproven thing (candidate: real-window UI path — out of scope; and arg: password buffers in TS arena memory — best-effort per threat model).
 
 - [x] **Step 7: Commit** — `git-safe-commit "test: full-loop vault round-trip, smoke, mutation gates, ledger"` (split docs into a second commit if cleaner).
+
+- [x] **Step 8: Commit effects-channel oracles + viewUnbound** — landed in `9926e61` (`host_roundtrip_tests.zig`, `src/core.ts`) on the UI redesign merge (`7b2331c` / PR #30).
 
 ---
 

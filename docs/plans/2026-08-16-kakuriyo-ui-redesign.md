@@ -304,7 +304,7 @@ Expected: all PASS.
 - [x] **Step 2: README update**
 - [x] **Step 3: Final `nix-shell --run "npm run gate"` PASS**
 - [x] **Step 4: Commit** `docs: README for redesigned vault UI`
-- [ ] **Step 5: Push branch, open PR, merge**
+- [x] **Step 5: Push branch, open PR, merge**
 
 ```bash
 git push -u origin HEAD
