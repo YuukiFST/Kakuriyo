@@ -16,6 +16,10 @@ pub fn setController(ctrl: *Ctrl) void {
     active = ctrl;
 }
 
+pub fn clearController() void {
+    active = null;
+}
+
 pub fn controller() ?*Ctrl {
     return active;
 }
@@ -88,7 +92,7 @@ pub fn handle(msg: core.Msg) bool {
                 }
             } else if (idx < ctrl.tree_row_count) {
                 ctrl.selectNode(ctrl.tree_rows[idx].id);
-                ctrl.slots.focus_region = 0;
+                ctrl.pinTreeKeys();
             }
             return true;
         },
@@ -211,15 +215,19 @@ pub fn handle(msg: core.Msg) bool {
             return true;
         },
         .editor_focus => {
-            ctrl.slots.focus_region = 1;
+            ctrl.releaseTreeKeys();
             return true;
         },
         .tree_focus => {
-            ctrl.slots.focus_region = 0;
+            ctrl.pinTreeKeys();
             return true;
         },
         .focus_cycle => {
-            ctrl.slots.focus_region = if (ctrl.slots.focus_region == 0) 1 else 0;
+            if (ctrl.slots.focus_region == 0) {
+                ctrl.releaseTreeKeys();
+            } else {
+                ctrl.pinTreeKeys();
+            }
             return true;
         },
         .refresh_preview => {
@@ -288,27 +296,27 @@ pub fn handle(msg: core.Msg) bool {
         },
         .entry_title_input => |ev| {
             if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.title, mapped);
-            ctrl.slots.focus_region = 1;
+            ctrl.releaseTreeKeys();
             return true;
         },
         .entry_url_input => |ev| {
             if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.url, mapped);
-            ctrl.slots.focus_region = 1;
+            ctrl.releaseTreeKeys();
             return true;
         },
         .entry_user_input => |ev| {
             if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.user, mapped);
-            ctrl.slots.focus_region = 1;
+            ctrl.releaseTreeKeys();
             return true;
         },
         .entry_pass_input => |ev| {
             if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.pass, mapped);
-            ctrl.slots.focus_region = 1;
+            ctrl.releaseTreeKeys();
             return true;
         },
         .entry_body_input => |ev| {
             if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.body, mapped);
-            ctrl.slots.focus_region = 1;
+            ctrl.releaseTreeKeys();
             return true;
         },
         .filter_input => |ev| {

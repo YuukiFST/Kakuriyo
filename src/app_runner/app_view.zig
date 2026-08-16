@@ -134,12 +134,18 @@ fn explorerPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
             false;
         const spaces = "                ";
         const indent = spaces[0..@min(@as(usize, row.depth) * 2, spaces.len)];
+        const select_msg: core.Msg = .{ .select_row = @as(f64, @floatFromInt(i)) };
+        const pin_folder = selected and ctrl.pin_tree_widget_focus and ctrl.slots.focus_region == 0;
+        const row_key: u64 = (@as(u64, i) << 32) | (if (pin_folder) ctrl.tree_focus_gen else 0);
 
         rows[n] = ui.listItem(.{
-            .on_press = .{ .select_row = @as(f64, @floatFromInt(i)) },
+            .key = .{ .int = row_key },
+            .on_press = select_msg,
+            .on_change = select_msg,
             .selected = selected,
             .tree_level = @as(u16, row.depth) + 1,
             .expanded = row.expanded,
+            .autofocus = pin_folder,
             .semantics = .{ .role = .treeitem },
         }, ui.fmt("{s}{s}  {s}", .{ indent, twisty, row.title }));
         n += 1;

@@ -474,6 +474,7 @@ fn tsCoreStage(b: *std.Build, dep: *std.Build.Dependency, app_root: []const u8, 
     // P3: the wiring's test seam imports this beside the mirror.
     _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/host_roundtrip_tests.zig")), "host_roundtrip_tests.zig");
     _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/app_tree_cap_tests.zig")), "app_tree_cap_tests.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/app_widget_focus_tests.zig")), "app_widget_focus_tests.zig");
     return .{ .main_root = main_root, .archive = archive };
 }
 
