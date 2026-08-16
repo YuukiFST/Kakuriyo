@@ -320,7 +320,7 @@ pub fn handle(msg: core.Msg) bool {
             return true;
         },
         .tree_horiz => |delta| {
-            const id = ctrl.selected_id orelse return true;
+            const id = ctrl.listingCollectionId() orelse return true;
             if (ctrl.findTreeIndex(id)) |idx| {
                 if (ctrl.tree_rows[idx].kind == 0) {
                     const d: i32 = @as(i32, @intFromFloat(delta));

@@ -902,7 +902,7 @@ pub const AppController = struct {
 
     pub fn moveTreeSelection(self: *AppController, delta: i32) void {
         if (self.tree_row_count == 0) return;
-        const cur = if (self.selected_id) |sid| self.findTreeIndex(sid) orelse 0 else 0;
+        const cur = if (self.listingCollectionId()) |lid| self.findTreeIndex(lid) orelse 0 else 0;
         var next: i32 = @as(i32, @intCast(cur)) + delta;
         if (next < 0) next = 0;
         if (next >= self.tree_row_count) next = @intCast(self.tree_row_count - 1);
