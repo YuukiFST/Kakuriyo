@@ -13,8 +13,8 @@
             .{
                 .label = "main",
                 .title = "Kakuriyo",
-                .width = 480,
-                .height = 320,
+                .width = 1280,
+                .height = 800,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{
