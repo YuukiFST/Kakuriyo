@@ -1,16 +1,5 @@
 <column gap="16" padding="24" grow="1">
   <text size="heading">Kakuriyo</text>
-  <text>Local encrypted vault — Zig host service connected.</text>
-  <column gap="8">
-    <text size="heading">What works now</text>
-    <text>Envelope crypto (Argon2id + XChaCha20-Poly1305) in vault.zig</text>
-    <text>vault.* dispatch over the effects channel (create/unlock/save/lock/change)</text>
-    <text>Smoke + mutation gates prove the file lifecycle offline</text>
-  </column>
-  <column gap="8">
-    <text size="heading">Session UI</text>
-    <text>Unlock / save / lock screens wait on the TS compiled-lane fix (0.8.3).</text>
-    <text>Until then, verify with: nix-shell --run "npm run gate"</text>
-  </column>
-  <button label="Ping host seam" on-press="ping_attempt:{lastPing}" />
+  <text>Session and vault UI render from the Zig view (app_view.zig).</text>
+  <text>This markup placeholder satisfies native check; the IDE layout is built in Zig.</text>
 </column>
