@@ -378,11 +378,11 @@ fn applyPasswordEdit(ctrl: *Ctrl, ev: core.TextInputEvent, confirm: bool) void {
 }
 
 test "password insert accumulates" {
-    const io = std.testing.io_instance;
+    const io = std.testing.io;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
     defer alloc.free(path);
 
     var ctrl = try Ctrl.init(io, alloc, path);
@@ -390,6 +390,6 @@ test "password insert accumulates" {
     setController(&ctrl);
 
     const text = "hello";
-    try handle(.{ .password_input = .{ .insert_text = text } });
+    try std.testing.expect(handle(.{ .password_input = .{ .insert_text = text } }));
     try std.testing.expectEqualStrings("hello", ctrl.passwordSlice());
 }
