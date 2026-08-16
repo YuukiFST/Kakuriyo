@@ -1,4 +1,4 @@
-//! Kakuriyo native UI — auth, Links ingest+preview, Senhas gate+CRUD.
+//! Kakuriyo native UI — Unlock, Collection tree, Entry list, Preview.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -76,14 +76,14 @@ fn passwordFieldRow(
 }
 
 fn mainView(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    const body = if (ctrl.slots.activity == @intFromEnum(app_controller.Activity.senhas))
-        senhasShell(ui, ctrl)
-    else
-        linksShell(ui, ctrl);
-
     var stacked = ui.column(.{ .grow = 1 }, .{
         topBar(ui, ctrl),
-        body,
+        pasteBar(ui, ctrl),
+        ui.row(.{ .grow = 1 }, .{
+            explorerPane(ui, ctrl),
+            entryListPane(ui, ctrl),
+            detailPane(ui, ctrl),
+        }),
     });
     if (ctrl.slots.show_delete_modal != 0) {
         stacked = ui.stack(.{ .grow = 1 }, .{ stacked, deleteModal(ui) });
@@ -92,39 +92,31 @@ fn mainView(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
 }
 
 fn topBar(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    const links_on = ctrl.slots.activity == 0;
-    const senhas_on = ctrl.slots.activity == 1;
+    _ = ctrl;
     return ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
         ui.text(.{ .size = .heading }, "Kakuriyo"),
         ui.spacer(1),
-        ui.button(.{
-            .variant = if (links_on) .primary else .ghost,
-            .on_press = .{ .activity_tab = 0 },
-        }, "Links"),
-        ui.button(.{
-            .variant = if (senhas_on) .primary else .ghost,
-            .on_press = .{ .activity_tab = 1 },
-        }, "Senhas"),
+        ui.button(.{ .on_press = .add_collection }, "Folder"),
         ui.button(.{ .on_press = .lock_press }, "Lock"),
     });
 }
 
-fn linksShell(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    return ui.column(.{ .grow = 1 }, .{
-        ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
-            ui.textField(.{
-                .placeholder = "Cole URLs http(s) — uma por linha",
-                .text = ctrl.pasteText(),
-                .grow = 1,
-                .on_input = text_input_bridge.pasteInput,
-            }),
-            ui.button(.{ .variant = .primary, .on_press = .ingest_press }, "Ingerir"),
+fn pasteBar(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
+    return ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
+        ui.textField(.{
+            .placeholder = "Paste http(s) URLs — many at once",
+            .text = ctrl.pasteText(),
+            .grow = 1,
+            .on_input = text_input_bridge.pasteInput,
         }),
-        ui.row(.{ .grow = 1 }, .{
-            explorerPane(ui, ctrl),
-            editorPane(ui, ctrl),
-            previewPane(ui, ctrl),
+        ui.textField(.{
+            .placeholder = "Save as folder (optional)",
+            .text = ctrl.groupText(),
+            .width = 220,
+            .on_input = text_input_bridge.groupInput,
+            .on_submit = .ingest_press,
         }),
+        ui.button(.{ .variant = .primary, .on_press = .ingest_press }, "Save"),
     });
 }
 
@@ -134,32 +126,73 @@ fn explorerPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
     var i: usize = 0;
     while (i < ctrl.tree_row_count) : (i += 1) {
         const row = ctrl.tree_rows[i];
-        var label_buf: [512]u8 = undefined;
-        const twisty: []const u8 = if (row.kind == 0)
-            if (row.expanded) "▾" else "▸"
-        else
-            "·";
-        var indent_buf: [64]u8 = undefined;
-        @memset(&indent_buf, ' ');
-        const indent_len = @min(row.depth * 2, indent_buf.len);
-        const indent = indent_buf[0..indent_len];
-        const label = std.fmt.bufPrint(&label_buf, "{s}{s}  {s}", .{ indent, twisty, row.title }) catch row.title;
-
-        const selected = if (ctrl.selected_id) |sid|
-            std.mem.eql(u8, &sid, &row.id)
+        const twisty: []const u8 = if (row.expanded) "▾" else "▸";
+        const listing = ctrl.listingCollectionId();
+        const selected = if (listing) |lid|
+            std.mem.eql(u8, &lid, &row.id)
         else
             false;
+        const spaces = "                ";
+        const indent = spaces[0..@min(@as(usize, row.depth) * 2, spaces.len)];
 
         rows[n] = ui.listItem(.{
             .on_press = .{ .select_row = @as(f64, @floatFromInt(i)) },
             .selected = selected,
-        }, label);
+            .tree_level = @as(u16, row.depth) + 1,
+            .expanded = row.expanded,
+            .semantics = .{ .role = .treeitem },
+        }, ui.fmt("{s}{s}  {s}", .{ indent, twisty, row.title }));
         n += 1;
     }
 
-    return ui.column(.{ .width = 280 }, .{
-        ui.panel(.{ .padding = 8 }, ui.text(.{ .size = .sm }, "Coleções")),
-        ui.scroll(.{ .grow = 1 }, if (n > 0) ui.column(.{}, rows[0..n]) else ui.column(.{}, .{})),
+    return ui.column(.{ .width = 260 }, .{
+        ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
+            ui.text(.{ .size = .sm }, "Folders"),
+        }),
+        ui.scroll(.{ .grow = 1 }, if (n > 0) ui.tree(.{ .semantics = .{ .label = "Folders" } }, rows[0..n]) else ui.column(.{}, .{})),
+    });
+}
+
+fn entryListPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
+    var rows: [app_controller.max_entry_rows_pub]AppUi.Node = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < ctrl.entry_row_count) : (i += 1) {
+        const row = ctrl.entry_rows[i];
+        const selected = if (ctrl.selected_id) |sid|
+            std.mem.eql(u8, &sid, &row.id)
+        else
+            false;
+        rows[n] = ui.listItem(.{
+            .on_press = .{ .select_entry = @as(f64, @floatFromInt(i)) },
+            .selected = selected,
+        }, row.title);
+        n += 1;
+    }
+
+    const empty = if (ctrl.listingCollectionId() == null)
+        "Select a folder"
+    else
+        "No links in this folder";
+
+    return ui.column(.{ .width = 320, .grow = 1 }, .{
+        ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
+            ui.text(.{ .size = .sm }, "Links"),
+            ui.textField(.{
+                .placeholder = "Filter",
+                .text = ctrl.filterText(),
+                .grow = 1,
+                .on_input = text_input_bridge.filterInput,
+            }),
+        }),
+        ui.scroll(.{ .grow = 1 }, if (n > 0) ui.column(.{}, rows[0..n]) else ui.panel(.{ .padding = 12 }, ui.text(.{}, empty))),
+    });
+}
+
+fn detailPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
+    return ui.column(.{ .padding = 12, .gap = 8, .grow = 1 }, .{
+        editorPane(ui, ctrl),
+        previewPane(ui, ctrl),
     });
 }
 
@@ -168,12 +201,14 @@ fn editorPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
     const url = ctrl.editorUrl();
     const body = ctrl.editorBody();
     const has_entry = ctrl.hasSelectedEntry();
-    return ui.column(.{ .padding = 12, .gap = 8, .grow = 1 }, .{
-        ui.text(.{ .size = .sm }, "Título"),
-        if (has_entry)
+    const title_editable = has_entry or ctrl.hasSelectedCollection();
+    const title_label: []const u8 = if (ctrl.hasSelectedCollection()) "Folder name" else "Title";
+    return ui.column(.{ .gap = 8 }, .{
+        ui.text(.{ .size = .sm }, title_label),
+        if (title_editable)
             ui.textField(.{
                 .text = title,
-                .placeholder = "Título",
+                .placeholder = title_label,
                 .grow = 1,
                 .on_input = text_input_bridge.entryTitleInput,
             })
@@ -189,20 +224,21 @@ fn editorPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
             })
         else
             ui.panel(.{ .padding = 8 }, ui.text(.{}, "—")),
-        ui.text(.{ .size = .sm }, "Notas"),
+        ui.text(.{ .size = .sm }, "Notes"),
         if (has_entry)
             ui.textField(.{
                 .text = body,
-                .placeholder = "Notas",
+                .placeholder = "Notes",
                 .grow = 1,
                 .on_input = text_input_bridge.entryBodyInput,
             })
         else
-            ui.panel(.{ .padding = 8, .grow = 1 }, ui.text(.{}, "—")),
+            ui.panel(.{ .padding = 8 }, ui.text(.{}, "—")),
         ui.row(.{ .gap = 8 }, .{
-            ui.button(.{ .variant = .primary, .on_press = .save_entry }, "Salvar"),
+            ui.button(.{ .variant = .primary, .on_press = .save_entry }, "Save"),
             ui.button(.{ .on_press = .refresh_preview }, "Refresh"),
-            ui.button(.{ .on_press = .delete_press }, "Apagar"),
+            ui.button(.{ .on_press = .open_url }, "Open"),
+            ui.button(.{ .on_press = .delete_press }, "Delete"),
         }),
     });
 }
@@ -211,123 +247,25 @@ fn previewPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
     const cached_title = ctrl.previewTitle();
     const cached_desc = ctrl.previewDescription();
     const image = ctrl.previewImage();
-    var thumb_buf: [64]u8 = undefined;
     const thumb = if (image.len > 0)
-        std.fmt.bufPrint(&thumb_buf, "thumbnail cached ({d} bytes)", .{image.len}) catch "thumbnail cached"
+        ui.fmt("thumbnail cached ({d} bytes)", .{image.len})
     else
-        "sem thumbnail";
-    return ui.column(.{ .width = 280, .padding = 12, .gap = 8 }, .{
+        "no thumbnail";
+    return ui.column(.{ .gap = 8, .grow = 1 }, .{
         ui.text(.{ .size = .sm }, "Preview"),
         ui.panel(.{ .padding = 12 }, ui.text(.{}, thumb)),
         ui.text(.{ .size = .heading }, if (cached_title.len > 0) cached_title else "—"),
-        ui.scroll(.{ .grow = 1 }, ui.text(.{ .wrap = true }, if (cached_desc.len > 0) cached_desc else "Select paints cache only — no network.")),
-    });
-}
-
-fn senhasShell(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    return switch (ctrl.slots.senhas_gate_state) {
-        0 => senhasCreate(ui, ctrl),
-        1 => senhasUnlock(ui, ctrl),
-        else => senhasCrud(ui, ctrl),
-    };
-}
-
-fn senhasCreate(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    const err = ctrl.errorText();
-    return ui.column(.{ .grow = 1, .main = .center, .cross = .center, .padding = 24 }, .{
-        ui.panel(.{ .width = 420, .padding = 24 }, ui.column(.{ .gap = 12 }, .{
-            ui.text(.{ .size = .heading }, "Senhas"),
-            ui.text(.{}, "Crie a senha-gate (maiúscula, minúscula, dígito, especial)."),
-            passwordFieldRow(ui, ctrl.passwordDisplay(), "Senha-gate", text_input_bridge.passwordInput, null),
-            passwordFieldRow(ui, ctrl.confirmDisplay(), "Confirmar", text_input_bridge.confirmInput, .senhas_gate_create),
-            if (err.len > 0) ui.text(.{}, err) else ui.spacer(0),
-            ui.button(.{ .variant = .primary, .on_press = .senhas_gate_create }, "Criar gate"),
-        })),
-    });
-}
-
-fn senhasUnlock(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    const err = ctrl.errorText();
-    return ui.column(.{ .grow = 1, .main = .center, .cross = .center, .padding = 24 }, .{
-        ui.panel(.{ .width = 420, .padding = 24 }, ui.column(.{ .gap = 12 }, .{
-            ui.text(.{ .size = .heading }, "Senhas"),
-            ui.text(.{}, "Desbloqueie o gate de senhas."),
-            passwordFieldRow(ui, ctrl.passwordDisplay(), "Senha-gate", text_input_bridge.passwordInput, .senhas_gate_unlock),
-            if (err.len > 0) ui.text(.{}, err) else ui.spacer(0),
-            ui.button(.{ .variant = .primary, .on_press = .senhas_gate_unlock }, "Desbloquear"),
-        })),
-    });
-}
-
-fn senhasCrud(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    const reveal = ctrl.slots.reveal_secrets != 0;
-    const pass = ctrl.editorPass();
-    const pass_display = if (reveal or pass.len == 0) pass else "••••••••";
-    var rows: [256]AppUi.Node = undefined;
-    var n: usize = 0;
-    for (ctrl.store.secrets.items, 0..) |s, i| {
-        if (n >= rows.len) break;
-        const selected = if (ctrl.selected_secret) |sid|
-            std.mem.eql(u8, &sid, &s.id)
-        else
-            false;
-        rows[n] = ui.listItem(.{
-            .on_press = .{ .select_row = @as(f64, @floatFromInt(i)) },
-            .selected = selected,
-        }, s.label);
-        n += 1;
-    }
-    return ui.row(.{ .grow = 1 }, .{
-        ui.column(.{ .width = 260 }, .{
-            ui.panel(.{ .padding = 8 }, ui.text(.{ .size = .sm }, "Segredos")),
-            ui.scroll(.{ .grow = 1 }, if (n > 0) ui.column(.{}, rows[0..n]) else ui.column(.{}, .{})),
-            ui.button(.{ .on_press = .secret_add }, "+ Segredo"),
-        }),
-        ui.column(.{ .padding = 12, .gap = 8, .grow = 1 }, .{
-            ui.text(.{ .size = .sm }, "Rótulo"),
-            ui.textField(.{
-                .text = ctrl.editorTitle(),
-                .placeholder = "Rótulo",
-                .grow = 1,
-                .on_input = text_input_bridge.entryTitleInput,
-            }),
-            ui.text(.{ .size = .sm }, "Usuário"),
-            ui.textField(.{
-                .text = ctrl.editorUser(),
-                .placeholder = "Usuário",
-                .grow = 1,
-                .on_input = text_input_bridge.entryUserInput,
-            }),
-            ui.text(.{ .size = .sm }, "Senha"),
-            ui.textField(.{
-                .text = pass_display,
-                .placeholder = "Senha",
-                .grow = 1,
-                .on_input = text_input_bridge.entryPassInput,
-            }),
-            ui.text(.{ .size = .sm }, "Notas"),
-            ui.textField(.{
-                .text = ctrl.editorBody(),
-                .placeholder = "Notas",
-                .grow = 1,
-                .on_input = text_input_bridge.entryBodyInput,
-            }),
-            ui.row(.{ .gap = 8 }, .{
-                ui.button(.{ .variant = .primary, .on_press = .secret_save }, "Salvar"),
-                ui.button(.{ .on_press = .toggle_reveal }, if (reveal) "Ocultar" else "Revelar"),
-                ui.button(.{ .on_press = .secret_delete }, "Apagar"),
-            }),
-        }),
+        ui.scroll(.{ .grow = 1 }, ui.text(.{ .wrap = true }, if (cached_desc.len > 0) cached_desc else "Select an entry — cache only, no network until Refresh.")),
     });
 }
 
 fn deleteModal(ui: *AppUi) AppUi.Node {
     return ui.panel(.{ .padding = 24, .grow = 1 }, ui.column(.{ .gap = 12 }, .{
-        ui.text(.{ .size = .heading }, "Apagar?"),
-        ui.text(.{}, "Isto não pode ser desfeito."),
+        ui.text(.{ .size = .heading }, "Delete?"),
+        ui.text(.{}, "This cannot be undone."),
         ui.row(.{ .gap = 8 }, .{
-            ui.button(.{ .variant = .primary, .on_press = .confirm_delete }, "Confirmar"),
-            ui.button(.{ .on_press = .dismiss_delete }, "Cancelar"),
+            ui.button(.{ .variant = .primary, .on_press = .confirm_delete }, "Confirm"),
+            ui.button(.{ .on_press = .dismiss_delete }, "Cancel"),
         }),
     }));
 }

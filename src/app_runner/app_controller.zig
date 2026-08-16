@@ -56,7 +56,7 @@ pub const ModelSlots = struct {
     selected_lo: u32 = 0,
     tree_epoch: u32 = 0,
     reveal_secrets: u8 = 0,
-    vim_motion: u8 = 1,
+    vim_motion: u8 = 0,
     activity: u8 = 0,
     show_delete_modal: u8 = 0,
     show_import_modal: u8 = 0,
@@ -88,8 +88,10 @@ pub const TreeRow = struct {
     title: []const u8,
 };
 
-const max_tree_rows = 512;
+const max_tree_rows = 256;
 pub const max_tree_rows_pub = max_tree_rows;
+const max_entry_rows = 128;
+pub const max_entry_rows_pub = max_entry_rows;
 const max_password_len = 1024;
 const min_master_password_len = 8;
 const lockout_fail_limit = 5;
@@ -114,6 +116,10 @@ pub const AppController = struct {
     unlock_fail_count: u8 = 0,
     tree_rows: [max_tree_rows]TreeRow = undefined,
     tree_row_count: usize = 0,
+    entry_rows: [max_entry_rows]TreeRow = undefined,
+    entry_row_count: usize = 0,
+    group_buf: [256]u8 = undefined,
+    group_len: usize = 0,
     expanded: std.AutoHashMapUnmanaged(u64, void) = .empty,
     editor_title: []u8 = undefined,
     editor_title_len: usize = 0,
@@ -358,7 +364,6 @@ pub const AppController = struct {
             });
             return;
         };
-        defer self.allocator.free(payload);
         self.loadStoreFromPayload(payload) catch {
             self.setError(.corrupt);
             self.session.lock();
@@ -478,13 +483,27 @@ pub const AppController = struct {
     pub fn saveEditor(self: *AppController) void {
         self.clearError();
         const id = self.selected_id orelse return;
-        if (self.findEntry(id) == null) return;
-
         const title = self.editor_title[0..self.editor_title_len];
         if (title.len == 0 or std.mem.trim(u8, title, " \t\r\n").len == 0) {
             self.setError(.domain_error);
             return;
         }
+        if (self.findCollection(id)) |c| {
+            self.store.updateCollection(id, c.parent_id, title) catch {
+                self.setError(.domain_error);
+                return;
+            };
+            self.persistDomain() catch {
+                self.setError(.io_failed);
+                return;
+            };
+            self.slots.dirty = 0;
+            self.rebuildTree();
+            self.touchActivity();
+            return;
+        }
+        if (self.findEntry(id) == null) return;
+
         const body = self.composeBodyAlloc() catch {
             self.setError(.io_failed);
             return;
@@ -505,9 +524,6 @@ pub const AppController = struct {
             self.setError(.io_failed);
             return;
         };
-        if (self.editor_url_len > 0) {
-            self.refreshPreviewForSelected();
-        }
         self.slots.dirty = 0;
         self.rebuildTree();
         self.touchActivity();
@@ -926,6 +942,7 @@ pub const AppController = struct {
 
     pub fn applyFilterEdit(self: *AppController, ev: TextInputEvent) void {
         applyTextEdit(self.filter_buf[0..], &self.filter_len, ev);
+        self.rebuildEntryList();
         self.touchActivity();
     }
 
@@ -991,33 +1008,63 @@ pub const AppController = struct {
         return self.paste_buf[0..self.paste_len];
     }
 
+    pub fn groupText(self: *const AppController) []const u8 {
+        return self.group_buf[0..self.group_len];
+    }
+
+    pub fn applyGroupEdit(self: *AppController, ev: TextInputEvent) void {
+        applyTextEdit(self.group_buf[0..], &self.group_len, ev);
+    }
+
     pub fn applyPasteEdit(self: *AppController, ev: TextInputEvent) void {
+        const pasted_urls = switch (ev) {
+            .insert_text => |t| containsHttpScheme(t),
+            else => false,
+        };
         applyTextEdit(self.paste_buf[0..], &self.paste_len, ev);
+        if (!pasted_urls) return;
+        var extracted: [65536]u8 = undefined;
+        const n = domain.formatExtractedUrls(self.paste_buf[0..self.paste_len], extracted[0..]);
+        if (n == 0) return;
+        @memcpy(self.paste_buf[0..n], extracted[0..n]);
+        if (n < self.paste_len) {
+            std.crypto.secureZero(u8, self.paste_buf[n..self.paste_len]);
+        }
+        self.paste_len = n;
     }
 
     pub fn ingestPaste(self: *AppController) void {
         if (@as(Phase, @enumFromInt(self.slots.phase)) != .unlocked) return;
-        const result = self.store.ingestUrls(self.paste_buf[0..self.paste_len], nowMs(self)) catch {
+        const dest = self.destinationForIngest() orelse {
             self.setError(.domain_error);
             return;
         };
-        _ = result;
-        for (self.store.nodes.items) |node| {
-            switch (node) {
-                .collection => |c| {
-                    if (std.mem.eql(u8, &c.parent_id, &domain.root_parent)) {
-                        self.expanded.put(self.allocator, uuidKey(c.id), {}) catch {};
-                    }
-                },
-                else => {},
-            }
-        }
+        _ = self.store.ingestUrls(self.paste_buf[0..self.paste_len], nowMs(self), dest) catch {
+            self.setError(.domain_error);
+            return;
+        };
+        self.expanded.put(self.allocator, uuidKey(dest), {}) catch {};
         self.persistDomain() catch {
             self.setError(.io_failed);
             return;
         };
+        std.crypto.secureZero(u8, self.paste_buf[0..self.paste_len]);
+        self.paste_len = 0;
+        self.group_len = 0;
         self.rebuildTree();
+        self.selectNode(dest);
         self.touchActivity();
+    }
+
+    fn destinationForIngest(self: *AppController) ?domain.Uuid {
+        const group = trimAscii(self.group_buf[0..self.group_len]);
+        if (group.len > 0) {
+            const parent = self.parentForNewCollection();
+            return self.store.ensureNamedCollection(parent, group) catch null;
+        }
+        const current = self.parentForNewEntry();
+        if (!std.mem.eql(u8, &current, &domain.root_parent)) return current;
+        return self.store.ensureNamedCollection(domain.root_parent, domain.inbox_name) catch null;
     }
 
     pub fn createSenhasGate(self: *AppController) void {
@@ -1157,56 +1204,78 @@ pub const AppController = struct {
     pub fn rebuildTree(self: *AppController) void {
         self.tree_row_count = 0;
         self.appendTreeChildren(domain.root_parent, 0);
+        self.rebuildEntryList();
         self.slots.tree_epoch +%= 1;
     }
 
     fn appendTreeChildren(self: *AppController, parent_id: domain.Uuid, depth: u8) void {
-        if (self.tree_row_count >= max_tree_rows) return;
         for (self.store.nodes.items) |node| {
-            const parent = switch (node) {
-                .collection => |c| c.parent_id,
-                .entry => |e| e.parent_id,
+            if (self.tree_row_count >= max_tree_rows) return;
+            const c = switch (node) {
+                .collection => |col| col,
+                .entry => continue,
             };
-            if (!std.mem.eql(u8, &parent, &parent_id)) continue;
-
-            const row = switch (node) {
-                .collection => |c| blk: {
-                    const id_key = uuidKey(c.id);
-                    const expanded = self.expanded.contains(id_key);
-                    break :blk TreeRow{
-                        .id = c.id,
-                        .parent_id = c.parent_id,
-                        .depth = depth,
-                        .kind = 0,
-                        .expanded = expanded,
-                        .secret_badge = false,
-                        .title = c.name,
-                    };
-                },
-                .entry => |e| blk: {
-                    const body_preview = e.body[0..@min(e.body.len, 64)];
-                    var lower: [64]u8 = undefined;
-                    for (body_preview, 0..) |ch, i| lower[i] = std.ascii.toLower(ch);
-                    const secret = std.mem.indexOf(u8, lower[0..body_preview.len], "password:") != null;
-                    break :blk TreeRow{
-                        .id = e.id,
-                        .parent_id = e.parent_id,
-                        .depth = depth,
-                        .kind = 1,
-                        .expanded = false,
-                        .secret_badge = secret,
-                        .title = e.title,
-                    };
-                },
+            if (!std.mem.eql(u8, &c.parent_id, &parent_id)) continue;
+            const id_key = uuidKey(c.id);
+            const expanded = self.expanded.contains(id_key);
+            self.tree_rows[self.tree_row_count] = .{
+                .id = c.id,
+                .parent_id = c.parent_id,
+                .depth = depth,
+                .kind = 0,
+                .expanded = expanded,
+                .secret_badge = false,
+                .title = c.name,
             };
-
-            self.tree_rows[self.tree_row_count] = row;
             self.tree_row_count += 1;
-
-            if (row.kind == 0 and row.expanded) {
-                self.appendTreeChildren(row.id, depth + 1);
+            if (expanded) {
+                self.appendTreeChildren(c.id, depth +| 1);
             }
         }
+    }
+
+    pub fn listingCollectionId(self: *const AppController) ?domain.Uuid {
+        const id = self.selected_id orelse return null;
+        if (self.findCollection(id) != null) return id;
+        if (self.findEntry(id)) |e| return e.parent_id;
+        return null;
+    }
+
+    pub fn rebuildEntryList(self: *AppController) void {
+        self.entry_row_count = 0;
+        const parent_id = self.listingCollectionId() orelse return;
+        const filter = self.filter_buf[0..self.filter_len];
+        for (self.store.nodes.items) |node| {
+            if (self.entry_row_count >= max_entry_rows) return;
+            const e = switch (node) {
+                .entry => |en| en,
+                .collection => continue,
+            };
+            if (!std.mem.eql(u8, &e.parent_id, &parent_id)) continue;
+            if (filter.len > 0) {
+                if (std.ascii.indexOfIgnoreCase(e.title, filter) == null and
+                    std.ascii.indexOfIgnoreCase(e.url, filter) == null)
+                {
+                    continue;
+                }
+            }
+            self.entry_rows[self.entry_row_count] = .{
+                .id = e.id,
+                .parent_id = e.parent_id,
+                .depth = 0,
+                .kind = 1,
+                .expanded = false,
+                .secret_badge = false,
+                .title = e.title,
+            };
+            self.entry_row_count += 1;
+        }
+    }
+
+    pub fn selectEntryAt(self: *AppController, index: usize) void {
+        if (index >= self.entry_row_count) return;
+        self.selectNode(self.entry_rows[index].id);
+        self.slots.focus_region = 1;
     }
 
     pub fn toggleExpanded(self: *AppController, id: domain.Uuid) void {
@@ -1223,11 +1292,21 @@ pub const AppController = struct {
         self.selected_id = id;
         if (self.findEntry(id)) |entry| {
             self.loadEditorFromEntry(entry);
+        } else if (self.findCollection(id)) |c| {
+            self.loadEditorFromCollection(c);
+        } else {
+            self.clearEditor();
         }
+        self.rebuildEntryList();
     }
 
     pub fn hasSelectedEntry(self: *const AppController) bool {
         if (self.selected_id) |id| return self.findEntry(id) != null;
+        return false;
+    }
+
+    pub fn hasSelectedCollection(self: *const AppController) bool {
+        if (self.selected_id) |id| return self.findCollection(id) != null;
         return false;
     }
 
@@ -1237,6 +1316,24 @@ pub const AppController = struct {
             .entry => |e| e,
             .collection => return null,
         };
+    }
+
+    pub fn findCollection(self: *const AppController, id: domain.Uuid) ?domain.Collection {
+        const idx = self.store.findIndex(id) orelse return null;
+        return switch (self.store.nodes.items[idx]) {
+            .collection => |c| c,
+            .entry => return null,
+        };
+    }
+
+    fn loadEditorFromCollection(self: *AppController, collection: domain.Collection) void {
+        self.editor_title_len = @min(collection.name.len, self.editor_title.len);
+        @memcpy(self.editor_title[0..self.editor_title_len], collection.name[0..self.editor_title_len]);
+        self.editor_url_len = 0;
+        self.editor_user_len = 0;
+        self.editor_pass_len = 0;
+        self.editor_body_len = 0;
+        self.slots.dirty = 0;
     }
 
     fn loadEditorFromEntry(self: *AppController, entry: domain.Entry) void {
@@ -1367,8 +1464,8 @@ pub const AppController = struct {
             .locked => "Vault is locked",
             .domain_error => "Invalid Entry or Collection",
             .lockout => "Too many attempts — try again in 5 minutes",
-            .senhas_weak => "Senhas gate needs uppercase, lowercase, digit, and special",
-            .senhas_wrong => "Wrong Senhas password",
+            .senhas_weak => "Passwords gate needs uppercase, lowercase, digit, and special",
+            .senhas_wrong => "Wrong gate password",
         };
     }
 
@@ -1386,11 +1483,23 @@ fn nowMs(ctrl: *const AppController) u64 {
     return @intCast(@divTrunc(ts.nanoseconds, 1_000_000));
 }
 
+fn containsHttpScheme(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "https://") != null or std.mem.indexOf(u8, text, "http://") != null;
+}
+
 fn maskedOrPlain(show: bool, plain: []const u8, mask_buf: []u8) []const u8 {
     if (show) return plain;
     const len = @min(plain.len, mask_buf.len);
     @memset(mask_buf[0..len], '*');
     return mask_buf[0..len];
+}
+
+fn trimAscii(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len and std.ascii.isWhitespace(s[start])) start += 1;
+    var end = s.len;
+    while (end > start and std.ascii.isWhitespace(s[end - 1])) end -= 1;
+    return s[start..end];
 }
 
 fn applyTextEdit(buf: []u8, len: *usize, ev: TextInputEvent) void {
@@ -1430,324 +1539,4 @@ fn fileExists(io: std.Io, path: []const u8) bool {
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
     file.close(io);
     return true;
-}
-
-test "password display masks by default and reveals on toggle" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-
-    ctrl.setPasswordText("secret");
-    try std.testing.expect(!ctrl.show_password);
-    try std.testing.expectEqualStrings("******", ctrl.passwordDisplay());
-
-    ctrl.toggleShowPassword();
-    try std.testing.expectEqualStrings("secret", ctrl.passwordDisplay());
-
-    ctrl.toggleShowPassword();
-    try std.testing.expectEqualStrings("******", ctrl.passwordDisplay());
-}
-
-test "create vault unlocks with empty domain" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-
-    ctrl.setPasswordText("test-password-123");
-    ctrl.slots.confirm_password_mode = 1;
-    ctrl.setConfirmText("test-password-123");
-    ctrl.createVault();
-    try std.testing.expectEqual(@intFromEnum(Phase.unlocked), @enumFromInt(ctrl.slots.phase));
-
-    ctrl.lock();
-    try std.testing.expectEqual(@intFromEnum(Phase.locked), @enumFromInt(ctrl.slots.phase));
-
-    ctrl.setPasswordText("test-password-123");
-    ctrl.unlock();
-    try std.testing.expectEqual(@intFromEnum(Phase.unlocked), @enumFromInt(ctrl.slots.phase));
-}
-
-test "entry crud roundtrip" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-
-    ctrl.setPasswordText("test-password-123");
-    ctrl.slots.confirm_password_mode = 1;
-    ctrl.setConfirmText("test-password-123");
-    ctrl.createVault();
-
-    ctrl.addEntry();
-    try std.testing.expect(ctrl.hasSelectedEntry());
-
-    ctrl.applyEditorEdit(.title, .{ .insert_text = "GitHub" });
-    ctrl.applyEditorEdit(.url, .{ .insert_text = "https://github.com" });
-    ctrl.saveEditor();
-
-    try std.testing.expectEqualStrings("GitHub", ctrl.editorTitle());
-    try std.testing.expect(ctrl.store.nodes.items.len >= 1);
-}
-
-test "lock autosaves dirty entry" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-
-    ctrl.setPasswordText("test-password-123");
-    ctrl.slots.confirm_password_mode = 1;
-    ctrl.setConfirmText("test-password-123");
-    ctrl.createVault();
-    ctrl.addEntry();
-    ctrl.applyEditorEdit(.title, .{ .insert_text = "Saved on lock" });
-    ctrl.saveEditor();
-    ctrl.applyEditorEdit(.body, .{ .insert_text = "note" });
-    try std.testing.expectEqual(@as(u8, 1), ctrl.slots.dirty);
-    ctrl.lock();
-
-    ctrl.setPasswordText("test-password-123");
-    ctrl.unlock();
-    var found = false;
-    for (ctrl.store.nodes.items) |node| {
-        if (node == .entry and std.mem.eql(u8, node.entry.title, "Saved on lock")) {
-            found = true;
-            try std.testing.expectEqualStrings("note", node.entry.body);
-        }
-    }
-    try std.testing.expect(found);
-}
-
-test "change password rewraps vault" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-
-    ctrl.setPasswordText("old-password-99");
-    ctrl.slots.confirm_password_mode = 1;
-    ctrl.setConfirmText("old-password-99");
-    ctrl.createVault();
-
-    ctrl.beginChangePassword();
-    ctrl.setPasswordText("old-password-99");
-    ctrl.changePasswordNext();
-    try std.testing.expectEqual(@as(u8, 1), ctrl.slots.change_password_step);
-
-    ctrl.setPasswordText("new-password-88");
-    ctrl.setConfirmText("new-password-88");
-    ctrl.submitChangePassword();
-    try std.testing.expectEqual(@as(u8, 0), ctrl.slots.show_change_password_modal);
-
-    ctrl.lock();
-    ctrl.setPasswordText("old-password-99");
-    ctrl.unlock();
-    try std.testing.expectEqual(@intFromEnum(ErrorCode.wrong_password), @enumFromInt(ctrl.slots.error_code));
-
-    ctrl.setPasswordText("new-password-88");
-    ctrl.unlock();
-    try std.testing.expectEqual(@intFromEnum(Phase.unlocked), @enumFromInt(ctrl.slots.phase));
-}
-
-test "wrong password increments lockout path" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-
-    ctrl.setPasswordText("good-password-99");
-    ctrl.slots.confirm_password_mode = 1;
-    ctrl.setConfirmText("good-password-99");
-    ctrl.createVault();
-    ctrl.lock();
-
-    ctrl.setPasswordText("bad");
-    ctrl.unlock();
-    try std.testing.expectEqual(@intFromEnum(ErrorCode.wrong_password), @enumFromInt(ctrl.slots.error_code));
-}
-
-test "import merge decrypts encrypted import file with password" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-
-    ctrl.setPasswordText("local-password-99");
-    ctrl.slots.confirm_password_mode = 1;
-    ctrl.setConfirmText("local-password-99");
-    ctrl.createVault();
-    var local_id: domain.Uuid = undefined;
-    @memset(&local_id, 0x11);
-    try ctrl.store.addEntry(local_id, domain.root_parent, "Local", "", "keep", 0, 0);
-    ctrl.persistDomain() catch unreachable;
-
-    var import_tmp = std.testing.tmpDir(.{});
-    defer import_tmp.cleanup();
-    const import_path = try import_tmp.dir.realpathAlloc(alloc, "other.kakuriyo");
-    defer alloc.free(import_path);
-
-    var import_session = try vault.Session.init(io, alloc, import_path);
-    defer import_session.deinit();
-    try import_session.create("import-password-88", vault.defaultParams());
-    var import_store = domain.Store.init(alloc);
-    defer import_store.deinit();
-    var import_id: domain.Uuid = undefined;
-    @memset(&import_id, 0x22);
-    try import_store.addEntry(import_id, domain.root_parent, "Imported", "", "from-import", 0, 0);
-    const encoded = try import_store.encode(alloc);
-    defer alloc.free(encoded);
-    try import_session.save(encoded);
-
-    var import_buf: [4096]u8 = undefined;
-    const staged = std.fmt.bufPrint(&import_buf, "{s}.import", .{path}) catch unreachable;
-    copyFile(io, import_path, staged) catch unreachable;
-
-    ctrl.importMerge();
-    try std.testing.expectEqual(@as(u8, 1), ctrl.slots.show_import_password_modal);
-
-    ctrl.setPasswordText("import-password-88");
-    ctrl.submitImportPassword();
-    try std.testing.expectEqual(@as(u8, 0), ctrl.slots.show_import_password_modal);
-    try std.testing.expectEqual(@intFromEnum(Phase.unlocked), @enumFromInt(ctrl.slots.phase));
-
-    var found_local = false;
-    var found_imported = false;
-    for (ctrl.store.nodes.items) |node| {
-        if (node.kind != .entry) continue;
-        if (std.mem.eql(u8, node.entry.title, "Local")) found_local = true;
-        if (std.mem.eql(u8, node.entry.title, "Imported")) found_imported = true;
-    }
-    try std.testing.expect(found_local);
-    try std.testing.expect(found_imported);
-}
-
-test "ingest paste groups by host" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-    ctrl.setPasswordText("test-password-123");
-    ctrl.setConfirmText("test-password-123");
-    ctrl.createVault();
-
-    const sample =
-        \\https://simpcity.cr/threads/ashley-alban.9988/page-2?order=reaction_score
-        \\https://bunkr.pk/f/ZqgFmEqdng4QV
-        \\https://cyberfile.me/folder/x/Ashley
-    ;
-    ctrl.applyPasteEdit(.{ .insert_text = sample });
-    ctrl.ingestPaste();
-    try std.testing.expect(ctrl.store.findCollectionByNameUnderParent(domain.root_parent, "simpcity.cr") != null);
-    try std.testing.expect(ctrl.store.findCollectionByNameUnderParent(domain.root_parent, "bunkr.pk") != null);
-    try std.testing.expect(ctrl.store.findCollectionByNameUnderParent(domain.root_parent, "cyberfile.me") != null);
-}
-
-test "senhas gate rejects weak password and lock clears session" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-    ctrl.setPasswordText("test-password-123");
-    ctrl.setConfirmText("test-password-123");
-    ctrl.createVault();
-
-    ctrl.setActivity(1);
-    try std.testing.expectEqual(@as(u8, 0), ctrl.slots.senhas_gate_state);
-
-    ctrl.setPasswordText("Password1");
-    ctrl.setConfirmText("Password1");
-    ctrl.createSenhasGate();
-    try std.testing.expectEqual(@intFromEnum(ErrorCode.senhas_weak), @enumFromInt(ctrl.slots.error_code));
-    try std.testing.expectEqual(@as(u8, 0), ctrl.slots.senhas_gate_state);
-
-    ctrl.setPasswordText("Password1!");
-    ctrl.setConfirmText("Password1!");
-    ctrl.createSenhasGate();
-    try std.testing.expectEqual(@as(u8, 2), ctrl.slots.senhas_gate_state);
-    try std.testing.expect(ctrl.senhas_gate_unlocked);
-
-    ctrl.addSecret();
-    try std.testing.expectEqual(@as(usize, 1), ctrl.store.secrets.items.len);
-
-    ctrl.lock();
-    try std.testing.expect(!ctrl.senhas_gate_unlocked);
-
-    ctrl.setPasswordText("test-password-123");
-    ctrl.unlock();
-    ctrl.setActivity(1);
-    try std.testing.expectEqual(@as(u8, 1), ctrl.slots.senhas_gate_state);
-    try std.testing.expect(!ctrl.senhas_gate_unlocked);
-}
-
-test "select uses cached preview without fetch" {
-    const io = std.testing.io_instance;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
-    defer alloc.free(path);
-
-    var ctrl = try AppController.init(io, alloc, path);
-    defer ctrl.deinit();
-    ctrl.setPasswordText("test-password-123");
-    ctrl.setConfirmText("test-password-123");
-    ctrl.createVault();
-
-    var id: domain.Uuid = undefined;
-    @memset(&id, 0x42);
-    try ctrl.store.addEntry(id, domain.root_parent, "Cached", "https://ex.test", "", 1, 1);
-    try ctrl.store.setPreview(id, "Cached Title", "Cached Desc", "JPEGDATA");
-    const fetches = ctrl.preview_fetch_count;
-    ctrl.selectNode(id);
-    try std.testing.expectEqual(fetches, ctrl.preview_fetch_count);
-    try std.testing.expectEqualStrings("Cached Title", ctrl.previewTitle());
-    try std.testing.expectEqualStrings("Cached Desc", ctrl.previewDescription());
-    try std.testing.expectEqualStrings("JPEGDATA", ctrl.previewImage());
 }

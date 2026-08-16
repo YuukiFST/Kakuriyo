@@ -249,8 +249,8 @@ pub fn fetchPreviewBudget(
     };
     var slot: Slot = .{};
     var future = io.concurrent(Slot.work, .{ &slot, io, allocator, url }) catch {
-        // Single-threaded Io: cannot enforce wall budget; still return owned strings.
-        return fetchPreviewUnbudgeted(io, allocator, url);
+        // No worker thread: unbudgeted GET would freeze the UI until TCP death.
+        return error.TimedOut;
     };
 
     var waited_ms: u32 = 0;

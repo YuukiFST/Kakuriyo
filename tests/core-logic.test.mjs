@@ -14,7 +14,7 @@ assert.equal(dispatch(resetHarness(), { kind: "unlock_press" }).phase, 0);
 assert.equal(dispatch(resetHarness(), { kind: "tick" }).treeEpoch, 0);
 
 const m0 = initialModel();
-assert.equal(m0.vimMotion, 1);
+assert.equal(m0.vimMotion, 0);
 assert.equal(m0.phase, 0);
 
 console.log("PASS identity core oracles");

@@ -81,6 +81,8 @@ export type Msg =
   | { readonly kind: "refresh_preview" }
   | { readonly kind: "ingest_press" }
   | { readonly kind: "paste_input"; readonly edit: TextInputEvent }
+  | { readonly kind: "group_input"; readonly edit: TextInputEvent }
+  | { readonly kind: "select_entry"; readonly row: number }
   | { readonly kind: "senhas_gate_create" }
   | { readonly kind: "senhas_gate_unlock" }
   | { readonly kind: "secret_add" }
@@ -168,6 +170,8 @@ export const viewUnbound = [
   "refresh_preview",
   "ingest_press",
   "paste_input",
+  "group_input",
+  "select_entry",
   "senhas_gate_create",
   "senhas_gate_unlock",
   "secret_add",
@@ -192,7 +196,7 @@ export function initialModel(): Model {
     selectedLo: 0,
     treeEpoch: 0,
     revealSecrets: 0,
-    vimMotion: 1,
+    vimMotion: 0,
     activity: 0,
     showDeleteModal: 0,
     showImportModal: 0,
@@ -262,6 +266,8 @@ export function update(model: Model, msg: Msg): Model {
     case "refresh_preview":
     case "ingest_press":
     case "paste_input":
+    case "group_input":
+    case "select_entry":
     case "senhas_gate_create":
     case "senhas_gate_unlock":
     case "secret_add":
@@ -292,7 +298,7 @@ export function commandMsg(name: string): Msg | null {
   if (name === "vault.import") return { kind: "import_vault" };
   if (name === "entry.add") return { kind: "add_entry" };
   if (name === "collection.add") return { kind: "add_collection" };
-  if (name === "vim.toggle") return { kind: "toggle_vim" };
+  if (name === "vim.toggle") return { kind: "tree_focus" };
   if (name === "vault.change_password") return { kind: "change_password_open" };
   if (name === "settings.open") return { kind: "dismiss_settings" };
   return null;

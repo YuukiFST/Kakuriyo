@@ -619,6 +619,23 @@ test "create then unlock returns the saved payload (round trip)" {
     try testing.expectEqualSlices(u8, "", got);
 }
 
+test "page_allocator unlock then save keeps session-owned payload" {
+    const page = std.heap.page_allocator;
+    var td = try TestDir.create(testing.allocator);
+    defer td.deinit(testing.allocator);
+
+    var s = try Session.init(testing.io, page, td.path);
+    defer s.deinit();
+
+    try s.create("pw-long-enough", defaultParams());
+    try s.save("owned-payload");
+    s.lock();
+    const view = try s.unlock("pw-long-enough");
+    try testing.expectEqualStrings("owned-payload", view);
+    try s.save("after-unlock");
+    try testing.expectEqualStrings("after-unlock", s.payload.?);
+}
+
 test "save persists and re-unlock reads the same payload" {
     const gpa = testing.allocator;
     var td = try TestDir.create(gpa);
