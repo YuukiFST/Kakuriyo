@@ -104,6 +104,11 @@ pub const AppController = struct {
     session: vault.Session,
     store: domain.Store,
     slots: ModelSlots = .{},
+    /// Source autofocus on the listing folder while tree keys own the UI.
+    pin_tree_widget_focus: bool = true,
+    /// Bumped on entry select so listing-row autofocus can edge-trigger
+    /// after a rebuild (same folder, new widget key).
+    tree_focus_gen: u32 = 0,
     password_buf: [max_password_len]u8 = undefined,
     password_len: usize = 0,
     confirm_buf: [max_password_len]u8 = undefined,
@@ -1272,11 +1277,23 @@ pub const AppController = struct {
         }
     }
 
+    pub fn pinTreeKeys(self: *AppController) void {
+        self.slots.focus_region = 0;
+        self.pin_tree_widget_focus = true;
+    }
+
+    pub fn releaseTreeKeys(self: *AppController) void {
+        self.slots.focus_region = 1;
+        self.pin_tree_widget_focus = false;
+    }
+
     pub fn selectEntryAt(self: *AppController, index: usize) void {
         if (index >= self.entry_row_count) return;
         self.selectNode(self.entry_rows[index].id);
         // Keep tree keyboard: Up/Down still walk folders from listingCollectionId.
         // Enter / F2 / typing in the editor still set focus_region = 1.
+        self.pinTreeKeys();
+        self.tree_focus_gen +%= 1;
     }
 
     pub fn toggleExpanded(self: *AppController, id: domain.Uuid) void {

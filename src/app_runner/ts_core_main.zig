@@ -177,6 +177,15 @@ pub fn installAppController(
     app_dispatch.syncModel(ctrl, &app_state.model);
 }
 
+pub fn uninstallAppController(allocator: std.mem.Allocator) void {
+    if (app_ctrl) |ctrl| {
+        ctrl.deinit();
+        allocator.destroy(ctrl);
+        app_ctrl = null;
+    }
+    app_dispatch.clearController();
+}
+
 /// Resolve the default vault path (config dir + vault.kakuriyo) into
 /// `output`; returns "" on resolution failure (the host then reports
 /// io_failed on first use instead of crashing).
@@ -269,6 +278,7 @@ test {
     _ = @import("host_roundtrip_tests.zig");
     _ = @import("app_tree_cap_tests.zig");
     _ = @import("app_keyboard.zig");
+    _ = @import("app_widget_focus_tests.zig");
 }
 
 /// The startup window title: the scene's first window title, else the
