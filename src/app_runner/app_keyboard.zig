@@ -36,6 +36,9 @@ fn mainKey(ctrl: *app_controller.AppController, keyboard: canvas.WidgetKeyboardE
         if (ctrl.slots.show_change_password_modal != 0) return .dismiss_change_password;
         return .tree_focus;
     }
+    if (eql(key, "tab")) {
+        return .focus_cycle;
+    }
 
     if (!tree_focus) return null;
 

@@ -444,7 +444,7 @@ test "entry list caps displayed rows" {
     try std.testing.expectEqual(@as(usize, 1), ctrl.tree_row_count);
 }
 
-test "entry select keeps listing folder; tree arrows move from that folder" {
+test "entry select keeps listing folder and tree focus; tree arrows move from that folder" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -475,6 +475,7 @@ test "entry select keeps listing folder; tree arrows move from that folder" {
     try std.testing.expect(ctrl.hasSelectedEntry());
     try std.testing.expectEqual(@as(usize, 1), ctrl.entry_row_count);
     ctrl.selectEntryAt(0);
+    try std.testing.expectEqual(@as(u8, 0), ctrl.slots.focus_region);
 
     const listing = ctrl.listingCollectionId() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, &third_id, &listing);

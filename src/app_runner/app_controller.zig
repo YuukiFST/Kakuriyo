@@ -1275,7 +1275,8 @@ pub const AppController = struct {
     pub fn selectEntryAt(self: *AppController, index: usize) void {
         if (index >= self.entry_row_count) return;
         self.selectNode(self.entry_rows[index].id);
-        self.slots.focus_region = 1;
+        // Keep tree keyboard: Up/Down still walk folders from listingCollectionId.
+        // Enter / F2 / typing in the editor still set focus_region = 1.
     }
 
     pub fn toggleExpanded(self: *AppController, id: domain.Uuid) void {
