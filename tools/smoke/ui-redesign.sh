@@ -15,6 +15,8 @@ grep -q 'emitDisplayList' src/app_runner/app_tree_cap_tests.zig || fail "missing
 grep -q 'ingestPaste same host stays one collapsed collection' src/app_runner/app_tree_cap_tests.zig || fail "missing Inbox keep-together oracle"
 grep -q 'ingestPaste into selected nested collection not host inbox' src/app_runner/app_tree_cap_tests.zig || fail "missing nested-folder ingest oracle"
 grep -q 'named group paste creates collection and keeps urls together' src/app_runner/app_tree_cap_tests.zig || fail "missing named-folder keep-together oracle"
+grep -q 'entry select keeps listing folder; tree arrows move from that folder' src/app_runner/app_tree_cap_tests.zig || fail "missing listing-folder tree-nav oracle"
+grep -q 'listingCollectionId' src/app_runner/app_controller.zig || fail "missing listingCollectionId"
 grep -q 'destinationForIngest' src/app_runner/app_controller.zig || fail "missing destinationForIngest"
 grep -q 'formatExtractedUrls splits glued urls one per line' src/vault/domain.zig || fail "missing glued-url extract oracle"
 grep -q 'ingestUrls splits glued urls and strips trailing punctuation' src/vault/domain.zig || fail "missing ingestUrls glued oracle"
@@ -30,4 +32,4 @@ if [ "${SKIP_TESTS:-}" != "1" ]; then
   zig build test-vault --summary all || fail "zig build test-vault"
 fi
 
-echo "PASS ui-redesign: create/unlock, paste keep-together (Inbox/named/nested), cache-first select, senhas gate, lock clears gate"
+echo "PASS ui-redesign: create/unlock, paste keep-together (Inbox/named/nested), listing-folder tree-nav, cache-first select, senhas gate, lock clears gate"
