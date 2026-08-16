@@ -1,5 +1,4 @@
-//! Keyboard routing — respects Vim/Classic profile and editor focus rules.
-//! Wired as `Options.on_key` (core.ts must not export `keyMsg`).
+//! Keyboard routing — classic keys only. Vim Motion is not a product language.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -7,8 +6,6 @@ const canvas = native_sdk.canvas;
 const core = @import("core.zig");
 const app_dispatch = @import("app_dispatch.zig");
 const app_controller = @import("app_controller.zig");
-
-var pending_g: bool = false;
 
 pub fn handleKeyEvent(keyboard: canvas.WidgetKeyboardEvent) ?core.Msg {
     const ctrl = app_dispatch.controller() orelse return null;
@@ -19,20 +16,18 @@ pub fn handleKeyEvent(keyboard: canvas.WidgetKeyboardEvent) ?core.Msg {
 }
 
 fn mainKey(ctrl: *app_controller.AppController, keyboard: canvas.WidgetKeyboardEvent) ?core.Msg {
-    const key = lowerKey(keyboard.key);
-    const vim = ctrl.slots.vim_motion != 0;
+    var key_buf: [64]u8 = undefined;
+    const key = lowerKey(keyboard.key, &key_buf);
+    const tree_focus = ctrl.slots.focus_region == 0;
+    const mods = keyboard.modifiers;
 
-    if (keyboard.modifiers.control and keyboard.modifiers.shift and eql(key, "l")) {
+    if (mods.control and mods.shift and eql(key, "l")) {
         return .lock_press;
     }
-    if (keyboard.modifiers.control and eql(key, "f")) {
-        return .filter_toggle;
-    }
-    if (eql(key, "/")) {
+    if (mods.control and eql(key, "f")) {
         return .filter_toggle;
     }
     if (eql(key, "escape")) {
-        pending_g = false;
         if (ctrl.slots.show_delete_modal != 0) return .dismiss_delete;
         if (ctrl.slots.show_import_modal != 0) return .dismiss_import;
         if (ctrl.slots.show_import_password_modal != 0) return .dismiss_import_password;
@@ -41,8 +36,11 @@ fn mainKey(ctrl: *app_controller.AppController, keyboard: canvas.WidgetKeyboardE
         if (ctrl.slots.show_change_password_modal != 0) return .dismiss_change_password;
         return .tree_focus;
     }
+
+    if (!tree_focus) return null;
+
     if (ctrl.slots.show_delete_modal != 0) {
-        if (eql(key, "y")) return .confirm_delete;
+        if (eql(key, "y") or eql(key, "enter")) return .confirm_delete;
         return null;
     }
     if (ctrl.slots.show_import_modal != 0) {
@@ -60,66 +58,31 @@ fn mainKey(ctrl: *app_controller.AppController, keyboard: canvas.WidgetKeyboardE
         return null;
     }
 
-    if (keyboard.modifiers.control and eql(key, "enter")) {
+    if (mods.control and eql(key, "enter")) {
         return .open_url;
     }
-    if (vim and eql(key, "g")) {
-        pending_g = true;
-        return null;
-    }
-    if (vim and pending_g and eql(key, "x")) {
-        pending_g = false;
-        return .open_url;
-    }
-    pending_g = false;
-
-    if (vim and eql(key, "x") and !keyboard.modifiers.control and !keyboard.modifiers.shift) {
-        return .cut_node;
-    }
-    if (vim and eql(key, "p") and !keyboard.modifiers.control) {
-        return .paste_node;
-    }
-    if ((vim and eql(key, "r")) or eql(key, "f2")) {
+    if (eql(key, "f2")) {
         return .editor_focus;
     }
     if (eql(key, "delete")) {
         return .delete_press;
     }
-    if (eql(key, "1")) return .{ .activity_tab = 0 };
-    if (eql(key, "2")) return .{ .activity_tab = 1 };
-    if (vim and eql(key, "a") and !keyboard.modifiers.shift) {
-        return .add_entry;
-    }
-    if (vim and eql(key, "a") and keyboard.modifiers.shift) {
+    if (mods.control and eql(key, "n")) {
         return .add_collection;
     }
 
-    if (keyboard.modifiers.control and eql(key, "w")) {
-        return .focus_cycle;
-    }
-
-    if (vim) {
-        if (eql(key, "j")) return .{ .move_tree = 1 };
-        if (eql(key, "k")) return .{ .move_tree = -1 };
-        if (eql(key, "h")) return .{ .tree_horiz = -1 };
-        if (eql(key, "l") and !keyboard.modifiers.control) return .{ .tree_horiz = 1 };
-    }
-
-    if (!vim or keyboard.modifiers.control) {
-        if (eql(key, "arrowdown")) return .{ .move_tree = 1 };
-        if (eql(key, "arrowup")) return .{ .move_tree = -1 };
-        if (eql(key, "arrowleft")) return .{ .tree_horiz = -1 };
-        if (eql(key, "arrowright")) return .{ .tree_horiz = 1 };
-    }
-    if (!vim and eql(key, "enter")) {
+    if (eql(key, "arrowdown")) return .{ .move_tree = 1 };
+    if (eql(key, "arrowup")) return .{ .move_tree = -1 };
+    if (eql(key, "arrowleft")) return .{ .tree_horiz = -1 };
+    if (eql(key, "arrowright")) return .{ .tree_horiz = 1 };
+    if (eql(key, "enter")) {
         return .editor_focus;
     }
 
     return null;
 }
 
-fn lowerKey(key: []const u8) []const u8 {
-    var buf: [64]u8 = undefined;
+fn lowerKey(key: []const u8, buf: *[64]u8) []const u8 {
     const len = @min(key.len, buf.len);
     for (key[0..len], 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
     return buf[0..len];
@@ -129,22 +92,60 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-test "vim j moves tree" {
+test "bare digits and letters do not steal when tree focused" {
     const io = std.testing.io_instance;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(alloc, "vault.kakuriyo");
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
     defer alloc.free(path);
 
     var ctrl = try app_controller.AppController.init(io, alloc, path);
     defer ctrl.deinit();
     app_dispatch.setController(&ctrl);
-    ctrl.slots.vim_motion = 1;
+    ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
+
+    try std.testing.expect(handleKeyEvent(.{ .key = "1", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(.{ .key = "2", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(.{ .key = "a", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(.{ .key = "j", .modifiers = .{} }) == null);
+}
+
+test "editor focus ignores tree motion keys" {
+    const io = std.testing.io_instance;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    defer ctrl.deinit();
+    app_dispatch.setController(&ctrl);
+    ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
+    ctrl.slots.focus_region = 1;
+
+    try std.testing.expect(handleKeyEvent(.{ .key = "j", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(.{ .key = "a", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(.{ .key = "arrowdown", .modifiers = .{} }) == null);
+    try std.testing.expect(handleKeyEvent(.{ .key = "delete", .modifiers = .{} }) == null);
+}
+
+test "arrowdown moves tree" {
+    const io = std.testing.io_instance;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    defer ctrl.deinit();
+    app_dispatch.setController(&ctrl);
     ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
 
     const msg = handleKeyEvent(.{
-        .key = "j",
+        .key = "arrowdown",
         .modifiers = .{},
     });
     try std.testing.expect(msg != null);

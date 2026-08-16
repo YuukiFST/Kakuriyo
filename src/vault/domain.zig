@@ -75,6 +75,8 @@ pub const Secret = struct {
     updated_ms: u64,
 };
 
+pub const inbox_name = "Inbox";
+
 pub const senhas_gate_t_cost: u32 = 1;
 pub const senhas_gate_m_cost: u32 = 8 * 1024;
 pub const senhas_gate_p_cost: u32 = 1;
@@ -111,6 +113,72 @@ pub fn extractHost(url: []const u8) ?[]const u8 {
     }
     if (end == 0) return null;
     return rest[0..end];
+}
+
+pub const UrlSpan = struct { start: usize, end: usize };
+
+fn isTrailingUrlPunct(ch: u8) bool {
+    return switch (ch) {
+        '.', ',', ';', ')', ']', '>', '\'', '"' => true,
+        else => false,
+    };
+}
+
+/// Next `http://` / `https://` span in `text` at or after `from`.
+/// Cuts at whitespace or the next scheme so glued URLs split.
+pub fn nextHttpUrlSpan(text: []const u8, from: usize) ?UrlSpan {
+    var search = from;
+    while (search < text.len) {
+        const rest = text[search..];
+        const http_i = std.mem.indexOf(u8, rest, "http://");
+        const https_i = std.mem.indexOf(u8, rest, "https://");
+        const rel: usize = blk: {
+            if (http_i == null and https_i == null) return null;
+            if (http_i == null) break :blk https_i.?;
+            if (https_i == null) break :blk http_i.?;
+            break :blk @min(http_i.?, https_i.?);
+        };
+        const start = search + rel;
+        const scheme_len: usize = if (std.mem.startsWith(u8, text[start..], "https://")) 8 else 7;
+        var end = start + scheme_len;
+        while (end < text.len) {
+            if (std.ascii.isWhitespace(text[end])) break;
+            if (std.mem.startsWith(u8, text[end..], "https://")) break;
+            if (std.mem.startsWith(u8, text[end..], "http://")) break;
+            end += 1;
+        }
+        while (end > start + scheme_len and isTrailingUrlPunct(text[end - 1])) {
+            end -= 1;
+        }
+        if (end > start + scheme_len) {
+            return .{ .start = start, .end = end };
+        }
+        search = start + scheme_len;
+    }
+    return null;
+}
+
+/// Write extracted URLs into `out`, one per line. Returns bytes written.
+/// Returns 0 when no URL found (caller keeps original text).
+pub fn formatExtractedUrls(text: []const u8, out: []u8) usize {
+    var from: usize = 0;
+    var o: usize = 0;
+    var first = true;
+    while (nextHttpUrlSpan(text, from)) |span| {
+        from = span.end;
+        const url = text[span.start..span.end];
+        if (!first) {
+            if (o >= out.len) break;
+            out[o] = '\n';
+            o += 1;
+        }
+        first = false;
+        const take = @min(url.len, out.len - o);
+        @memcpy(out[o .. o + take], url[0..take]);
+        o += take;
+        if (take < url.len) break;
+    }
+    return o;
 }
 
 pub fn normalizeHost(host: []const u8, out: []u8) []const u8 {
@@ -574,6 +642,14 @@ pub const Store = struct {
         return null;
     }
 
+    /// Find or create a Collection named `name` under `parent_id`.
+    pub fn ensureNamedCollection(self: *Store, parent_id: Uuid, name: []const u8) DomainError!Uuid {
+        if (self.findCollectionByNameUnderParent(parent_id, name)) |id| return id;
+        const id = newUuid();
+        try self.addCollection(id, parent_id, name);
+        return id;
+    }
+
     fn findEntryByTitleUnderParent(self: *const Store, parent_id: Uuid, title: []const u8) ?Uuid {
         for (self.nodes.items) |node| {
             switch (node) {
@@ -871,20 +947,17 @@ pub const Store = struct {
         };
     }
 
-    pub fn ingestUrls(self: *Store, text: []const u8, now_ms: u64) DomainError!IngestResult {
+    /// `dest` null (or omitted by callers as `null`): group by host under root.
+    /// `dest` set: every new entry lands in that collection (must exist).
+    pub fn ingestUrls(self: *Store, text: []const u8, now_ms: u64, dest: ?Uuid) DomainError!IngestResult {
+        if (dest) |d| {
+            if (!self.parentExists(d)) return error.InvalidParent;
+        }
         var result: IngestResult = .{};
-        var i: usize = 0;
-        while (i < text.len) {
-            while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
-            if (i >= text.len) break;
-            const start = i;
-            while (i < text.len and !std.ascii.isWhitespace(text[i])) i += 1;
-            const token = text[start..i];
-            const is_url = std.mem.startsWith(u8, token, "http://") or std.mem.startsWith(u8, token, "https://");
-            if (!is_url) {
-                result.invalid += 1;
-                continue;
-            }
+        var from: usize = 0;
+        while (nextHttpUrlSpan(text, from)) |span| {
+            from = span.end;
+            const token = text[span.start..span.end];
             const host_raw = extractHost(token) orelse {
                 result.invalid += 1;
                 continue;
@@ -899,7 +972,7 @@ pub const Store = struct {
                 result.skipped_dup += 1;
                 continue;
             }
-            const parent_id = try self.ensureHostCollection(host);
+            const parent_id = dest orelse try self.ensureHostCollection(host);
             var title_buf: [256]u8 = undefined;
             const title = titleFromUrl(token, &title_buf);
             try self.addEntryUniqueTitle(parent_id, title, token, now_ms);
@@ -1377,6 +1450,74 @@ test "secrets gate set verify and secret roundtrip" {
     try std.testing.expectEqualStrings("note", secret.notes);
 }
 
+test "ingestUrls same host is one collection not one per url" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc);
+    defer store.deinit();
+    const sample =
+        \\https://e-hentai.org/g/1/1fea9e2241/
+        \\https://e-hentai.org/g/2/fab9af6925/
+        \\https://e-hentai.org/g/3/d54c6bf833/
+        \\https://e-hentai.org/?f_search=%5Bfoo%5D
+    ;
+    const result = try store.ingestUrls(sample, 1000, null);
+    try std.testing.expectEqual(@as(u32, 4), result.created);
+    const host_id = store.findCollectionByNameUnderParent(root_parent, "e-hentai.org") orelse
+        return error.TestUnexpectedResult;
+    var collections: u32 = 0;
+    var root_entries: u32 = 0;
+    for (store.nodes.items) |node| {
+        switch (node) {
+            .collection => |c| {
+                if (std.mem.eql(u8, &c.parent_id, &root_parent)) collections += 1;
+            },
+            .entry => |e| {
+                if (std.mem.eql(u8, &e.parent_id, &root_parent)) root_entries += 1;
+                try std.testing.expectEqualSlices(u8, &host_id, &e.parent_id);
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1), collections);
+    try std.testing.expectEqual(@as(u32, 0), root_entries);
+}
+
+test "ensureNamedCollection reuses same name under parent" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc);
+    defer store.deinit();
+    const first = try store.ensureNamedCollection(root_parent, "XYZ");
+    const second = try store.ensureNamedCollection(root_parent, "xyz");
+    try std.testing.expectEqualSlices(u8, &first, &second);
+    const nested = try store.ensureNamedCollection(first, "QBitTorrent");
+    try std.testing.expect(!std.mem.eql(u8, &nested, &first));
+}
+
+test "ingestUrls dest collection skips host grouping" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc);
+    defer store.deinit();
+    var host_id: Uuid = undefined;
+    @memset(&host_id, 0x31);
+    try store.addCollection(host_id, root_parent, "amazon.com");
+    var folder_id: Uuid = undefined;
+    @memset(&folder_id, 0x32);
+    try store.addCollection(folder_id, host_id, "Livros");
+    const sample =
+        \\https://www.amazon.com/hz/wishlist/ls/BOOKS
+        \\https://www.amazon.com/hz/wishlist/ls/MORE
+        \\https://github.com/foo/bar
+    ;
+    const result = try store.ingestUrls(sample, 1000, folder_id);
+    try std.testing.expectEqual(@as(u32, 3), result.created);
+    try std.testing.expect(store.findCollectionByNameUnderParent(root_parent, "github.com") == null);
+    for (store.nodes.items) |node| {
+        switch (node) {
+            .entry => |e| try std.testing.expectEqualSlices(u8, &folder_id, &e.parent_id),
+            else => {},
+        }
+    }
+}
+
 test "ingestUrls groups by host and dedupes" {
     const alloc = std.testing.allocator;
     var store = Store.init(alloc);
@@ -1387,7 +1528,7 @@ test "ingestUrls groups by host and dedupes" {
         \\https://bunkr.pk/f/ZqgFmEqdng4QV
         \\https://cyberfile.me/folder/83a8f2407979ea70afc06e2414bc3a47/Ashley_Alban_2024
     ;
-    const result = try store.ingestUrls(sample, 1000);
+    const result = try store.ingestUrls(sample, 1000, null);
     try std.testing.expectEqual(@as(u32, 3), result.created);
     try std.testing.expectEqual(@as(u32, 1), result.skipped_dup);
     try std.testing.expectEqual(@as(u32, 0), result.invalid);
@@ -1396,4 +1537,65 @@ test "ingestUrls groups by host and dedupes" {
     for (hosts) |host| {
         try std.testing.expect(store.findCollectionByNameUnderParent(root_parent, host) != null);
     }
+}
+
+test "formatExtractedUrls splits glued urls one per line" {
+    const sample = "see https://a.test/xhttps://b.test/y, and https://a.test/x.";
+    var buf: [256]u8 = undefined;
+    const n = formatExtractedUrls(sample, &buf);
+    try std.testing.expectEqualStrings("https://a.test/x\nhttps://b.test/y\nhttps://a.test/x", buf[0..n]);
+}
+
+test "formatExtractedUrls empty when no url" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), formatExtractedUrls("not a link yet", &buf));
+}
+
+test "ingestUrls splits glued urls and strips trailing punctuation" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc);
+    defer store.deinit();
+    const sample = "junk https://simpcity.cr/threads/xhttps://bunkr.pk/f/ZqgFmEqdng4QV, https://cyberfile.me/folder/y.";
+    const result = try store.ingestUrls(sample, 1000, null);
+    try std.testing.expectEqual(@as(u32, 3), result.created);
+    try std.testing.expectEqual(@as(u32, 0), result.skipped_dup);
+    try std.testing.expectEqual(@as(u32, 0), result.invalid);
+    try std.testing.expect(store.findCollectionByNameUnderParent(root_parent, "simpcity.cr") != null);
+    try std.testing.expect(store.findCollectionByNameUnderParent(root_parent, "bunkr.pk") != null);
+    try std.testing.expect(store.findCollectionByNameUnderParent(root_parent, "cyberfile.me") != null);
+}
+
+test "ingestUrls e-hentai host query encodes" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc);
+    defer store.deinit();
+    const text =
+        \\https://e-hentai.org/g/1/1fea9e2241/
+        \\https://e-hentai.org/g/2/fab9af6925/
+        \\https://e-hentai.org/g/3/d54c6bf833/
+        \\https://e-hentai.org/?f_search=%5Bfoo%5D
+    ;
+    const result = try store.ingestUrls(text, 1000, null);
+    try std.testing.expectEqual(@as(u32, 4), result.created);
+    const encoded = try store.encode(alloc);
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len > 12);
+}
+
+test "ingestUrls accepts hundreds of urls then encodes" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc);
+    defer store.deinit();
+    var text: [24576]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < 600) : (i += 1) {
+        const line = std.fmt.bufPrint(text[n..], "https://bulk.test/u{d}\n", .{i}) catch unreachable;
+        n += line.len;
+    }
+    const result = try store.ingestUrls(text[0..n], 1000, null);
+    try std.testing.expectEqual(@as(u32, 600), result.created);
+    const encoded = try store.encode(alloc);
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len > 12);
 }

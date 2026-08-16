@@ -92,6 +92,11 @@ pub fn handle(msg: core.Msg) bool {
             }
             return true;
         },
+        .select_entry => |row| {
+            const idx: usize = @intFromFloat(row);
+            ctrl.selectEntryAt(idx);
+            return true;
+        },
         .toggle_row => |row| {
             const idx: usize = @intFromFloat(row);
             if (idx < ctrl.tree_row_count and ctrl.tree_rows[idx].kind == 0) {
@@ -109,7 +114,7 @@ pub fn handle(msg: core.Msg) bool {
             return true;
         },
         .toggle_vim => {
-            ctrl.slots.vim_motion = if (ctrl.slots.vim_motion != 0) 0 else 1;
+            ctrl.slots.vim_motion = 0;
             return true;
         },
         .filter_toggle => {
@@ -226,7 +231,11 @@ pub fn handle(msg: core.Msg) bool {
             return true;
         },
         .paste_input => |ev| {
-            ctrl.applyPasteEdit(mapEvent(ev));
+            if (mapEvent(ev)) |mapped| ctrl.applyPasteEdit(mapped);
+            return true;
+        },
+        .group_input => |ev| {
+            if (mapEvent(ev)) |mapped| ctrl.applyGroupEdit(mapped);
             return true;
         },
         .senhas_gate_create => {
@@ -278,32 +287,32 @@ pub fn handle(msg: core.Msg) bool {
             return true;
         },
         .entry_title_input => |ev| {
-            ctrl.applyEditorEdit(.title, mapEvent(ev));
+            if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.title, mapped);
             ctrl.slots.focus_region = 1;
             return true;
         },
         .entry_url_input => |ev| {
-            ctrl.applyEditorEdit(.url, mapEvent(ev));
+            if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.url, mapped);
             ctrl.slots.focus_region = 1;
             return true;
         },
         .entry_user_input => |ev| {
-            ctrl.applyEditorEdit(.user, mapEvent(ev));
+            if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.user, mapped);
             ctrl.slots.focus_region = 1;
             return true;
         },
         .entry_pass_input => |ev| {
-            ctrl.applyEditorEdit(.pass, mapEvent(ev));
+            if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.pass, mapped);
             ctrl.slots.focus_region = 1;
             return true;
         },
         .entry_body_input => |ev| {
-            ctrl.applyEditorEdit(.body, mapEvent(ev));
+            if (mapEvent(ev)) |mapped| ctrl.applyEditorEdit(.body, mapped);
             ctrl.slots.focus_region = 1;
             return true;
         },
         .filter_input => |ev| {
-            ctrl.applyFilterEdit(mapEvent(ev));
+            if (mapEvent(ev)) |mapped| ctrl.applyFilterEdit(mapped);
             return true;
         },
         .move_tree => |delta| {
@@ -329,15 +338,13 @@ pub fn handle(msg: core.Msg) bool {
     }
 }
 
-fn mapEvent(ev: core.TextInputEvent) app_controller.TextInputEvent {
+fn mapEvent(ev: core.TextInputEvent) ?app_controller.TextInputEvent {
     return switch (ev) {
         .insert_text => |t| .{ .insert_text = t },
         .delete_backward => .delete_backward,
         .delete_forward => .delete_forward,
         .clear => .clear,
-        // Selection / caret / IME extras: controller buffer has no caret.
-        // Never map them to delete_backward (that ate chars on Ctrl+A / paste).
-        else => .delete_forward,
+        else => null,
     };
 }
 

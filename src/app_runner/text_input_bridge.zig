@@ -49,14 +49,13 @@ pub fn toCoreEvent(edit: canvas.TextInputEvent) core.TextInputEvent {
     };
 }
 
-fn toControllerEvent(edit: canvas.TextInputEvent) app_controller.TextInputEvent {
+fn toControllerEvent(edit: canvas.TextInputEvent) ?app_controller.TextInputEvent {
     return switch (edit) {
         .insert_text => |t| .{ .insert_text = t },
         .delete_backward => .delete_backward,
         .delete_forward => .delete_forward,
         .clear => .clear,
-        // Selection/caret/IME: no caret model on controller buffers.
-        else => .delete_forward,
+        else => null,
     };
 }
 
@@ -92,16 +91,20 @@ pub fn pasteInput(edit: canvas.TextInputEvent) core.Msg {
     return .{ .paste_input = toCoreEvent(edit) };
 }
 
+pub fn groupInput(edit: canvas.TextInputEvent) core.Msg {
+    return .{ .group_input = toCoreEvent(edit) };
+}
+
 pub fn filterInput(edit: canvas.TextInputEvent) core.Msg {
     return .{ .filter_input = toCoreEvent(edit) };
 }
 
 pub fn applyToController(ctrl: *app_controller.AppController, field: app_controller.EditorField, edit: canvas.TextInputEvent) void {
-    ctrl.applyEditorEdit(field, toControllerEvent(edit));
+    if (toControllerEvent(edit)) |mapped| ctrl.applyEditorEdit(field, mapped);
 }
 
 pub fn applyFilter(ctrl: *app_controller.AppController, edit: canvas.TextInputEvent) void {
-    ctrl.applyFilterEdit(toControllerEvent(edit));
+    if (toControllerEvent(edit)) |mapped| ctrl.applyFilterEdit(mapped);
 }
 
 test "select-all sentinel set_selection does not panic" {
