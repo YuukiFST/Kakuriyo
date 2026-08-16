@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# gate-ts: the TS-core seam over the effects channel.
+# gate-ts: TS core state machine + effects-channel binding oracles.
 #
-# RE-SCOPED from the plan (documented in
-# .scratch/kakuriyo/research/ts-core-lane-limits.md): the scriptc
-# compiled lane of @native-sdk/cli 0.8.3 cannot sustain request-routed
-# or allocating updates, so the core is the fire-and-forget ping core
-# and the round trip is proven at the binding level (sendFn/requestFn
-# oracles in the app suite). This gate runs that suite; the node core
-# harness from the plan is replaced by it.
+# Node harness runs outside the compiled lane (see
+# .scratch/kakuriyo/research/ts-core-lane-limits.md). Zig suite
+# still proves sendFn/requestFn at the binding level.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+
+echo "gate-ts: tsc --noEmit"
+npx tsc --noEmit
+
+echo "gate-ts: node core harness (ts_run)"
+npm run test:core
+
+echo "gate-ts: zig binding oracles"
 zig build test -Dplatform=null --summary all

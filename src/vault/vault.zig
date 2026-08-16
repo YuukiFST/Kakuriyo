@@ -408,6 +408,137 @@ pub const Session = struct {
     }
 };
 
+fn readVaultBytes(io: Io, allocator: std.mem.Allocator, path: []const u8) error{ FileNotFound, OutOfMemory, Io, PayloadTooLarge }![]u8 {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return error.Io,
+    };
+    defer file.close(io);
+    const stat = file.stat(io) catch return error.Io;
+    if (stat.size > header_len + max_payload_len + tag_len) return error.PayloadTooLarge;
+    const len: usize = @intCast(stat.size);
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+    const n = file.readPositionalAll(io, out, 0) catch return error.Io;
+    if (n != len) return error.Io;
+    return out;
+}
+
+fn parseVaultHeader(bytes: []const u8) error{ Corrupt, UnsupportedVersion }!FileHeader {
+    if (bytes.len < header_len) return error.Corrupt;
+    if (!std.mem.eql(u8, bytes[0..4], magic)) return error.Corrupt;
+    const v = std.mem.readInt(u32, bytes[4..8], .big);
+    if (v != version) return error.UnsupportedVersion;
+    const params = KdfParams{
+        .m_cost = std.mem.readInt(u32, bytes[8..12], .big),
+        .t_cost = std.mem.readInt(u32, bytes[12..16], .big),
+        .p_cost = std.mem.readInt(u32, bytes[16..20], .big),
+    };
+    validateParams(params) catch return error.Corrupt;
+    return .{
+        .salt = bytes[20..36].*,
+        .params = params,
+        .dek_nonce = bytes[36..60].*,
+        .wrapped_dek = bytes[60..108].*,
+        .payload_nonce = bytes[108..132].*,
+    };
+}
+
+fn kdfStatic(
+    io: Io,
+    allocator: std.mem.Allocator,
+    password: []const u8,
+    salt: *const [salt_len]u8,
+    params: KdfParams,
+    kek: *[key_len]u8,
+) error{OutOfMemory}!void {
+    std.crypto.pwhash.argon2.kdf(
+        allocator,
+        kek,
+        password,
+        salt,
+        std.crypto.pwhash.argon2.Params{ .t = @intCast(params.t_cost), .m = @intCast(params.m_cost), .p = @intCast(params.p_cost) },
+        .argon2id,
+        io,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.OutOfMemory,
+    };
+}
+
+fn unwrapDekStatic(
+    kek: *const [key_len]u8,
+    nonce: *const [dek_nonce_len]u8,
+    wrapped: *const [wrapped_dek_len]u8,
+    out: *[key_len]u8,
+) error{AuthenticationFailed}!void {
+    try std.crypto.aead.chacha_poly.XChaCha20Poly1305.decrypt(
+        out,
+        wrapped[0..key_len],
+        wrapped[key_len..][0..tag_len].*,
+        aad,
+        nonce.*,
+        kek.*,
+    );
+}
+
+fn decryptPayloadStatic(
+    dek: *const [key_len]u8,
+    nonce: *const [payload_nonce_len]u8,
+    ct: []const u8,
+    allocator: std.mem.Allocator,
+) error{ OutOfMemory, AuthenticationFailed }![]u8 {
+    const pt = try allocator.alloc(u8, ct.len - tag_len);
+    errdefer allocator.free(pt);
+    try std.crypto.aead.chacha_poly.XChaCha20Poly1305.decrypt(
+        pt,
+        ct[0 .. ct.len - tag_len],
+        ct[ct.len - tag_len ..][0..tag_len].*,
+        aad,
+        nonce.*,
+        dek.*,
+    );
+    return pt;
+}
+
+/// Decrypts the domain payload from a vault file at `path` using
+/// `password`. Returns owned plaintext; caller must free.
+pub fn decryptPayloadFile(
+    io: Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    password: []const u8,
+) UnlockError![]u8 {
+    try validatePassword(password);
+
+    const bytes = readVaultBytes(io, allocator, path) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.PayloadTooLarge => return error.PayloadTooLarge,
+        else => return error.Io,
+    };
+    defer allocator.free(bytes);
+
+    const header = parseVaultHeader(bytes) catch |err| switch (err) {
+        error.UnsupportedVersion => return error.UnsupportedVersion,
+        else => return error.Corrupt,
+    };
+    if (bytes.len - header_len < tag_len) return error.Corrupt;
+    if (bytes.len - header_len - tag_len > max_payload_len) return error.PayloadTooLarge;
+
+    var kek: [key_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &kek);
+    try kdfStatic(io, allocator, password, &header.salt, header.params, &kek);
+
+    var dek: [key_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &dek);
+    unwrapDekStatic(&kek, &header.dek_nonce, &header.wrapped_dek, &dek) catch return error.WrongPassword;
+
+    return decryptPayloadStatic(&dek, &header.payload_nonce, bytes[header_len..], allocator) catch {
+        return error.Corrupt;
+    };
+}
+
 // =====================================================================
 // Task 2 oracles (the contract): every test below names one behavior
 // of the vault envelope. The implementation must make them all pass.
@@ -911,4 +1042,22 @@ test "property sweep: 40 random payloads round-trip" {
         const got = try s.unlock("pw");
         try testing.expectEqualSlices(u8, payload, got);
     }
+}
+
+test "decryptPayloadFile reads an encrypted vault without a session" {
+    const gpa = testing.allocator;
+    var td = try TestDir.create(gpa);
+    defer td.deinit(gpa);
+
+    var s = try td.openSession(gpa);
+    defer s.deinit();
+    try s.create("import-pw", defaultParams());
+    try s.save("domain-bytes");
+
+    const payload = try decryptPayloadFile(testing.io, gpa, td.path, "import-pw");
+    defer gpa.free(payload);
+    try testing.expectEqualSlices(u8, "domain-bytes", payload);
+
+    const bad = decryptPayloadFile(testing.io, gpa, td.path, "wrong");
+    try testing.expectError(error.WrongPassword, bad);
 }

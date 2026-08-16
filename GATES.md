@@ -11,10 +11,10 @@ Gates run in order; first failure stops the set (non-zero exit).
 | Gate | Script | Rule |
 |------|--------|------|
 | check | `tools/gates/gate-check.sh` | `native check --strict` — markup bindings, app.zon, TS subset. Patches `zig-out/model-contract.zon` with `viewUnbound` from the frontend contract (compiled sidecar gap). |
-| ts-core seam | `tools/gates/gate-ts.sh` | `zig build test -Dplatform=null` — effects channel + binding oracles (ping/echo/unknown). |
-| vault oracles | `tools/gates/gate-vault.sh` | `zig build test-vault` — envelope + host dispatch (30 tests, std-only). |
+| ts-core seam | `tools/gates/gate-ts.sh` | `zig build test -Dplatform=null` — effects channel + binding oracles (ping/echo/unknown + full vault lifecycle/rewrap/atomic/locked-save via `host_roundtrip_tests.zig`; node core harness 9 oracles). |
+| vault oracles | `tools/gates/gate-vault.sh` | `zig build test-vault` — envelope + host + domain (KDAT v3, senhas gate, ingest) + preview og:image. |
 | zig fmt | `tools/gates/gate-zig.sh` | `zig fmt --check` on `src`, `build`, `build.zig`. |
-| smoke | `tools/smoke/run.sh` | vault unit tests + app tests + `kakuriyo-smoke` driver; on-disk magic/version bounds via `od`. |
+| smoke | `tools/smoke/run.sh` | vault unit tests + app tests + `kakuriyo-smoke` driver + `tools/smoke/ui-redesign.sh` (ingest/select cache/senhas/lock). |
 | mutation | `tools/gates/gate-mutate.sh` | M1–M8 mutants; each must kill exactly one oracle (`tools/gates/mutate.sh`). |
 
 ## Mutation dispositions (M1–M8)

@@ -25,6 +25,11 @@ const manifest = @import("app_manifest_zon");
 pub const core = @import("core.zig");
 pub const vault = @import("vault.zig");
 pub const vault_host = @import("vault_host.zig");
+pub const app_controller = @import("app_controller.zig");
+pub const app_dispatch = @import("app_dispatch.zig");
+pub const app_view = @import("app_view.zig");
+const app_keyboard = @import("app_keyboard.zig");
+const text_input_bridge = @import("text_input_bridge.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -33,8 +38,36 @@ pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 pub const Model = core.Model;
 pub const Msg = core.Msg;
 
+/// App-owned controller — lives for the process lifetime beside vault_host.
+var app_ctrl: ?*app_controller.AppController = null;
+
+fn kakuriyoView(ui: *App.Ui, model: *const Model) App.Ui.Node {
+    const ctrl = app_ctrl orelse {
+        return ui.column(.{ .padding = 24 }, .{ui.text(.{}, "Kakuriyo starting…")});
+    };
+    return app_view.build(ui, model, ctrl);
+}
+
+fn interceptedUpdateFx(model: *Model, msg: Msg, fx: *App.Effects) void {
+    if (app_dispatch.handle(msg)) {
+        if (app_ctrl) |ctrl| {
+            app_dispatch.syncModel(ctrl, model);
+        }
+        return;
+    }
+    Host.dispatch(fx, msg);
+    model.* = Host.model().*;
+}
+
 const Adapter = native_sdk.TsUiApp(core);
 pub const App = Adapter.App;
+const Host = Adapter.Host;
+
+fn installAppDispatch(app_state: *App) void {
+    app_state.options.update_fx = interceptedUpdateFx;
+    app_state.options.view = kakuriyoView;
+    app_state.options.on_key = app_keyboard.handleKeyEvent;
+}
 
 const shell_scene = native_sdk.app_manifest.shellConfigFrom(manifest);
 pub const canvas_label = native_sdk.app_manifest.firstGpuSurfaceLabel(shell_scene);
@@ -129,6 +162,21 @@ pub fn createAppState(io: std.Io, allocator: std.mem.Allocator, environ_map: *st
     }, options);
 }
 
+/// Wire AppController + intercepted dispatch (call after createAppState).
+pub fn installAppController(
+    app_state: *App,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    vault_path: []const u8,
+) !void {
+    const ctrl = try allocator.create(app_controller.AppController);
+    ctrl.* = try app_controller.AppController.init(io, allocator, vault_path);
+    app_ctrl = ctrl;
+    app_dispatch.setController(ctrl);
+    installAppDispatch(app_state);
+    app_dispatch.syncModel(ctrl, &app_state.model);
+}
+
 /// Resolve the default vault path (config dir + vault.kakuriyo) into
 /// `output`; returns "" on resolution failure (the host then reports
 /// io_failed on first use instead of crashing).
@@ -193,6 +241,12 @@ pub fn main(init: std.process.Init) !void {
         .send_fn = vault_host.sendFn,
         .request_fn = vault_host.requestFn,
     });
+
+    try installAppController(app_state, init.io, std.heap.page_allocator, vault_path);
+    defer if (app_ctrl) |ctrl| {
+        ctrl.deinit();
+        std.heap.page_allocator.destroy(ctrl);
+    };
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = manifest.name,

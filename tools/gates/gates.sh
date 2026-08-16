@@ -21,6 +21,7 @@ run_gate "ts-core seam (effects channel)" tools/gates/gate-ts.sh
 run_gate "vault oracles (fast)" tools/gates/gate-vault.sh
 run_gate "zig fmt" tools/gates/gate-zig.sh
 run_gate "smoke sequence" tools/smoke/run.sh
+run_gate "package smoke" tools/gates/gate-package.sh
 run_gate "mutation (M1..M8)" tools/gates/gate-mutate.sh
 
 echo ""

@@ -5,7 +5,14 @@
   "dependencies": {
     "@native-sdk/core": "0.8.3"
   },
+  "devDependencies": {
+    "@typescript/old": "npm:typescript@6.0.3"
+  },
+  "type": "module",
   "scripts": {
-    "gate": "bash tools/gates/gates.sh"
+    "start": "bash run.sh",
+    "dev": "bash run.sh",
+    "gate": "bash tools/gates/gates.sh",
+    "test:core": "bash tests/run-core-logic.sh"
   }
 }

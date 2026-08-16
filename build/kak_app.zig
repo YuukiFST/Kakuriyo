@@ -464,6 +464,13 @@ fn tsCoreStage(b: *std.Build, dep: *std.Build.Dependency, app_root: []const u8, 
     const main_root = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/ts_core_main.zig")), "main.zig");
     _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/vault/vault.zig")), "vault.zig");
     _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/vault/vault_host.zig")), "vault_host.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/vault/domain.zig")), "domain.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/app_controller.zig")), "app_controller.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/app_dispatch.zig")), "app_dispatch.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/app_view.zig")), "app_view.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/app_keyboard.zig")), "app_keyboard.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/text_input_bridge.zig")), "text_input_bridge.zig");
+    _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/vault/preview.zig")), "preview.zig");
     // P3: the wiring's test seam imports this beside the mirror.
     _ = staged.addCopyFile(b.path(appPath(b, app_root, "src/app_runner/host_roundtrip_tests.zig")), "host_roundtrip_tests.zig");
     return .{ .main_root = main_root, .archive = archive };
