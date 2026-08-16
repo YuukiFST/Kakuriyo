@@ -93,6 +93,63 @@ pub fn passwordMeetsSenhasPolicy(pw: []const u8) bool {
     return has_upper and has_lower and has_digit and has_special;
 }
 
+pub const IngestResult = struct {
+    created: u32 = 0,
+    skipped_dup: u32 = 0,
+    invalid: u32 = 0,
+};
+
+pub fn extractHost(url: []const u8) ?[]const u8 {
+    const scheme_sep = std.mem.indexOf(u8, url, "://") orelse return null;
+    const rest = url[scheme_sep + 3 ..];
+    var end: usize = 0;
+    while (end < rest.len) : (end += 1) {
+        switch (rest[end]) {
+            '/', ':', '?', '#' => break,
+            else => {},
+        }
+    }
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
+pub fn normalizeHost(host: []const u8, out: []u8) []const u8 {
+    const n = @min(host.len, out.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        out[i] = std.ascii.toLower(host[i]);
+    }
+    const lowered = out[0..n];
+    if (std.mem.startsWith(u8, lowered, "www.") and lowered.len > 4) {
+        return lowered[4..];
+    }
+    return lowered;
+}
+
+fn titleFromUrl(url: []const u8, buf: []u8) []const u8 {
+    var path = url;
+    if (std.mem.indexOf(u8, url, "://")) |sep| {
+        path = url[sep + 3 ..];
+        if (std.mem.indexOfScalar(u8, path, '/')) |slash| {
+            path = path[slash..];
+        } else {
+            path = "";
+        }
+    }
+    if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q];
+    if (std.mem.indexOfScalar(u8, path, '#')) |h| path = path[0..h];
+    while (path.len > 0 and path[path.len - 1] == '/') {
+        path = path[0 .. path.len - 1];
+    }
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+        const tail = path[slash + 1 ..];
+        if (tail.len > 0) return tail;
+    }
+    const n = @min(url.len, buf.len);
+    @memcpy(buf[0..n], url[0..n]);
+    return buf[0..n];
+}
+
 /// In-memory vault contents. Owns all string storage.
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -503,7 +560,7 @@ pub const Store = struct {
         collection.name = try self.allocator.dupe(u8, name);
     }
 
-    fn findCollectionByNameUnderParent(self: *const Store, parent_id: Uuid, name: []const u8) ?Uuid {
+    pub fn findCollectionByNameUnderParent(self: *const Store, parent_id: Uuid, name: []const u8) ?Uuid {
         for (self.nodes.items) |node| {
             switch (node) {
                 .collection => |c| {
@@ -766,6 +823,89 @@ pub const Store = struct {
             return;
         }
         return error.NotFound;
+    }
+
+    fn urlExists(self: *const Store, url: []const u8) bool {
+        for (self.nodes.items) |node| {
+            switch (node) {
+                .entry => |e| {
+                    if (std.mem.eql(u8, e.url, url)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn ensureHostCollection(self: *Store, host: []const u8) DomainError!Uuid {
+        if (self.findCollectionByNameUnderParent(root_parent, host)) |id| return id;
+        const id = newUuid();
+        try self.addCollection(id, root_parent, host);
+        return id;
+    }
+
+    fn addEntryUniqueTitle(
+        self: *Store,
+        parent_id: Uuid,
+        title: []const u8,
+        url: []const u8,
+        now_ms: u64,
+    ) DomainError!void {
+        const id = newUuid();
+        self.addEntry(id, parent_id, title, url, "", now_ms, now_ms) catch |err| switch (err) {
+            error.DuplicateName => {
+                var suffix: u32 = 2;
+                var buf: [256]u8 = undefined;
+                while (suffix < 256) : (suffix += 1) {
+                    const alt = std.fmt.bufPrint(&buf, "{s} ({d})", .{ title, suffix }) catch return error.OutOfMemory;
+                    const alt_id = newUuid();
+                    self.addEntry(alt_id, parent_id, alt, url, "", now_ms, now_ms) catch |e2| switch (e2) {
+                        error.DuplicateName => continue,
+                        else => return e2,
+                    };
+                    return;
+                }
+                return error.DuplicateName;
+            },
+            else => return err,
+        };
+    }
+
+    pub fn ingestUrls(self: *Store, text: []const u8, now_ms: u64) DomainError!IngestResult {
+        var result: IngestResult = .{};
+        var i: usize = 0;
+        while (i < text.len) {
+            while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+            if (i >= text.len) break;
+            const start = i;
+            while (i < text.len and !std.ascii.isWhitespace(text[i])) i += 1;
+            const token = text[start..i];
+            const is_url = std.mem.startsWith(u8, token, "http://") or std.mem.startsWith(u8, token, "https://");
+            if (!is_url) {
+                result.invalid += 1;
+                continue;
+            }
+            const host_raw = extractHost(token) orelse {
+                result.invalid += 1;
+                continue;
+            };
+            var host_buf: [256]u8 = undefined;
+            const host = normalizeHost(host_raw, &host_buf);
+            if (host.len == 0) {
+                result.invalid += 1;
+                continue;
+            }
+            if (self.urlExists(token)) {
+                result.skipped_dup += 1;
+                continue;
+            }
+            const parent_id = try self.ensureHostCollection(host);
+            var title_buf: [256]u8 = undefined;
+            const title = titleFromUrl(token, &title_buf);
+            try self.addEntryUniqueTitle(parent_id, title, token, now_ms);
+            result.created += 1;
+        }
+        return result;
     }
 
     pub fn encode(self: *const Store, allocator: std.mem.Allocator) DomainError![]u8 {
@@ -1252,7 +1392,7 @@ test "ingestUrls groups by host and dedupes" {
     try std.testing.expectEqual(@as(u32, 1), result.skipped_dup);
     try std.testing.expectEqual(@as(u32, 0), result.invalid);
 
-    var hosts = [_][]const u8{ "simpcity.cr", "bunkr.pk", "cyberfile.me" };
+    const hosts = [_][]const u8{ "simpcity.cr", "bunkr.pk", "cyberfile.me" };
     for (hosts) |host| {
         try std.testing.expect(store.findCollectionByNameUnderParent(root_parent, host) != null);
     }
