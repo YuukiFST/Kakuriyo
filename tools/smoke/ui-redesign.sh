@@ -22,6 +22,7 @@ grep -q 'try std.testing.expect(app_dispatch.handle(msg.?))' src/app_runner/app_
 grep -q 'tab cycles focus from tree or editor' src/app_runner/app_keyboard.zig || fail "missing Tab focus_cycle oracle"
 grep -q 'widget click entry then arrowup moves listing folder' src/app_runner/app_widget_focus_tests.zig || fail "missing widget-click arrowup folder oracle"
 grep -q 'try std.testing.expect(!canvas.isWidgetTextEntry(focused.widget))' src/app_runner/app_widget_focus_tests.zig || fail "missing entry-click rejects text-field focus oracle"
+grep -q 'try std.testing.expectEqual(canvas.WidgetRole.treeitem, focused.widget.semantics.role)' src/app_runner/app_widget_focus_tests.zig || fail "missing entry-click pins listing-folder treeitem oracle"
 grep -q '_ = @import("app_widget_focus_tests.zig")' src/app_runner/ts_core_main.zig || fail "missing app_widget_focus test import"
 grep -q 'listingCollectionId' src/app_runner/app_controller.zig || fail "missing listingCollectionId"
 grep -q 'destinationForIngest' src/app_runner/app_controller.zig || fail "missing destinationForIngest"
@@ -39,4 +40,4 @@ if [ "${SKIP_TESTS:-}" != "1" ]; then
   zig build test-vault --summary all || fail "zig build test-vault"
 fi
 
-echo "PASS ui-redesign: create/unlock, paste keep-together (Inbox/named/nested), listing-folder tree-nav, entry-select tree keyboard, Tab/arrow keyboard oracles, arrowup dispatch after entry select, widget-click arrowup after entry select, cache-first select, senhas gate, lock clears gate"
+echo "PASS ui-redesign: create/unlock, paste keep-together (Inbox/named/nested), listing-folder tree-nav, entry-select tree keyboard, Tab/arrow keyboard oracles, arrowup dispatch after entry select, widget-click arrowup after entry select, entry-click pins listing-folder treeitem, cache-first select, senhas gate, lock clears gate"

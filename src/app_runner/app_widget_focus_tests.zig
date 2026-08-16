@@ -109,6 +109,11 @@ test "widget click entry then arrowup moves listing folder" {
     try std.testing.expect(focused_id != 0);
     const focused = after_click.findById(focused_id) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!canvas.isWidgetTextEntry(focused.widget));
+    // Quiet list-row fallthrough is a false green for live GTK: click can
+    // keep the link focused while Title never steals. Autofocus must pin
+    // the listing folder so ArrowUp walks treeitems after the link click.
+    try std.testing.expectEqual(canvas.WidgetRole.treeitem, focused.widget.semantics.role);
+    try std.testing.expect(std.mem.indexOf(u8, focused.widget.text, "New Collection 2") != null);
 
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .gpu_surface_input = .{
         .window_id = 1,
