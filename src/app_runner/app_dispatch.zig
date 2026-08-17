@@ -206,6 +206,22 @@ pub fn handle(msg: core.Msg) bool {
             ctrl.openSelectedUrl();
             return true;
         },
+        .open_all_urls => {
+            ctrl.openListingUrls(false);
+            return true;
+        },
+        .open_all_incognito => {
+            ctrl.openListingUrls(true);
+            return true;
+        },
+        .copy_url => {
+            ctrl.copySelectedUrl();
+            return true;
+        },
+        .copy_all_urls => {
+            ctrl.copyListingUrls();
+            return true;
+        },
         .cut_node => {
             ctrl.cutSelectedNode();
             return true;

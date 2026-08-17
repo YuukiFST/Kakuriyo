@@ -102,21 +102,25 @@ fn topBar(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
 }
 
 fn pasteBar(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
-    return ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
-        ui.textField(.{
-            .placeholder = "Paste http(s) URLs — many at once",
-            .text = ctrl.pasteText(),
-            .grow = 1,
-            .on_input = text_input_bridge.pasteInput,
+    const err = ctrl.errorText();
+    return ui.column(.{}, .{
+        ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
+            ui.textField(.{
+                .placeholder = "Paste http(s) URLs — many at once",
+                .text = ctrl.pasteText(),
+                .grow = 1,
+                .on_input = text_input_bridge.pasteInput,
+            }),
+            ui.textField(.{
+                .placeholder = "Save as folder (optional)",
+                .text = ctrl.groupText(),
+                .width = 220,
+                .on_input = text_input_bridge.groupInput,
+                .on_submit = .ingest_press,
+            }),
+            ui.button(.{ .variant = .primary, .on_press = .ingest_press }, "Save"),
         }),
-        ui.textField(.{
-            .placeholder = "Save as folder (optional)",
-            .text = ctrl.groupText(),
-            .width = 220,
-            .on_input = text_input_bridge.groupInput,
-            .on_submit = .ingest_press,
-        }),
-        ui.button(.{ .variant = .primary, .on_press = .ingest_press }, "Save"),
+        if (err.len > 0) ui.row(.{ .padding = 8 }, .{ui.text(.{}, err)}) else ui.spacer(0),
     });
 }
 
@@ -136,12 +140,12 @@ fn explorerPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
         const indent = spaces[0..@min(@as(usize, row.depth) * 2, spaces.len)];
         const select_msg: core.Msg = .{ .select_row = @as(f64, @floatFromInt(i)) };
         const pin_folder = selected and ctrl.pin_tree_widget_focus and ctrl.slots.focus_region == 0;
-        const row_key: u64 = (@as(u64, i) << 32) | (if (pin_folder) ctrl.tree_focus_gen else 0);
+        const row_key: u64 = app_controller.uuidKey(row.id) ^
+            (if (pin_folder) @as(u64, ctrl.tree_focus_gen) << 48 else 0);
 
         rows[n] = ui.listItem(.{
             .key = .{ .int = row_key },
             .on_press = select_msg,
-            .on_change = select_msg,
             .selected = selected,
             .tree_level = @as(u16, row.depth) + 1,
             .expanded = row.expanded,
@@ -170,6 +174,7 @@ fn entryListPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
         else
             false;
         rows[n] = ui.listItem(.{
+            .key = .{ .int = app_controller.uuidKey(row.id) },
             .on_press = .{ .select_entry = @as(f64, @floatFromInt(i)) },
             .selected = selected,
         }, row.title);
@@ -190,6 +195,11 @@ fn entryListPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
                 .grow = 1,
                 .on_input = text_input_bridge.filterInput,
             }),
+        }),
+        ui.row(.{ .padding = 8, .gap = 8, .cross = .center }, .{
+            ui.button(.{ .on_press = .open_all_urls }, "Open all"),
+            ui.button(.{ .on_press = .open_all_incognito }, "Incognito"),
+            ui.button(.{ .on_press = .copy_all_urls }, "Copy all"),
         }),
         ui.scroll(.{ .grow = 1 }, if (n > 0) ui.column(.{}, rows[0..n]) else ui.panel(.{ .padding = 12 }, ui.text(.{}, empty))),
     });
@@ -244,6 +254,7 @@ fn editorPane(ui: *AppUi, ctrl: *Ctrl) AppUi.Node {
             ui.button(.{ .variant = .primary, .on_press = .save_entry }, "Save"),
             ui.button(.{ .on_press = .refresh_preview }, "Refresh"),
             ui.button(.{ .on_press = .open_url }, "Open"),
+            ui.button(.{ .on_press = .copy_url }, "Copy"),
             ui.button(.{ .on_press = .delete_press }, "Delete"),
         }),
     });
