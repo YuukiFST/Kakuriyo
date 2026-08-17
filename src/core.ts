@@ -73,6 +73,10 @@ export type Msg =
   | { readonly kind: "change_password_submit" }
   | { readonly kind: "cycle_idle_preset" }
   | { readonly kind: "open_url" }
+  | { readonly kind: "open_all_urls" }
+  | { readonly kind: "open_all_incognito" }
+  | { readonly kind: "copy_url" }
+  | { readonly kind: "copy_all_urls" }
   | { readonly kind: "cut_node" }
   | { readonly kind: "paste_node" }
   | { readonly kind: "editor_focus" }
@@ -162,6 +166,10 @@ export const viewUnbound = [
   "change_password_submit",
   "cycle_idle_preset",
   "open_url",
+  "open_all_urls",
+  "open_all_incognito",
+  "copy_url",
+  "copy_all_urls",
   "cut_node",
   "paste_node",
   "editor_focus",
@@ -258,6 +266,10 @@ export function update(model: Model, msg: Msg): Model {
     case "change_password_submit":
     case "cycle_idle_preset":
     case "open_url":
+    case "open_all_urls":
+    case "open_all_incognito":
+    case "copy_url":
+    case "copy_all_urls":
     case "cut_node":
     case "paste_node":
     case "editor_focus":

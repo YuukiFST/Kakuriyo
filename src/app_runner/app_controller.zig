@@ -42,6 +42,10 @@ pub const ErrorCode = enum(u32) {
     lockout = 9,
     senhas_weak = 10,
     senhas_wrong = 11,
+    too_many_urls = 12,
+    no_links = 13,
+    incognito_unsupported = 14,
+    clipboard_failed = 15,
 };
 
 pub const Activity = enum(u8) {
@@ -92,6 +96,7 @@ const max_tree_rows = 256;
 pub const max_tree_rows_pub = max_tree_rows;
 const max_entry_rows = 128;
 pub const max_entry_rows_pub = max_entry_rows;
+pub const max_open_urls_pub = max_entry_rows;
 const max_password_len = 1024;
 const min_master_password_len = 8;
 const lockout_fail_limit = 5;
@@ -549,9 +554,113 @@ pub const AppController = struct {
 
     pub fn openSelectedUrl(self: *AppController) void {
         const url = self.editor_url[0..self.editor_url_len];
-        if (url.len == 0) return;
-        openUrlExternal(self.io, url) catch {};
+        if (url.len == 0) {
+            self.setError(.no_links);
+            return;
+        }
+        self.launchUrls(&.{url}, false);
         self.touchActivity();
+    }
+
+    pub fn openListingUrls(self: *AppController, incognito: bool) void {
+        var urls: [max_open_urls_pub][]const u8 = undefined;
+        const n = self.collectListingUrls(&urls) catch {
+            self.setError(.too_many_urls);
+            return;
+        };
+        if (n == 0) {
+            self.setError(.no_links);
+            return;
+        }
+        self.launchUrls(urls[0..n], incognito);
+        self.touchActivity();
+    }
+
+    pub fn copySelectedUrl(self: *AppController) void {
+        const url = self.editor_url[0..self.editor_url_len];
+        if (url.len == 0) {
+            self.setError(.no_links);
+            return;
+        }
+        copyTextExternal(self.io, url) catch {
+            self.setError(.clipboard_failed);
+            return;
+        };
+        self.clearError();
+        self.touchActivity();
+    }
+
+    pub fn copyListingUrls(self: *AppController) void {
+        var urls: [max_open_urls_pub][]const u8 = undefined;
+        const n = self.collectListingUrls(&urls) catch {
+            self.setError(.too_many_urls);
+            return;
+        };
+        if (n == 0) {
+            self.setError(.no_links);
+            return;
+        }
+        var joined: [65536]u8 = undefined;
+        const text = joinUrlLines(urls[0..n], &joined) catch {
+            self.setError(.too_many_urls);
+            return;
+        };
+        copyTextExternal(self.io, text) catch {
+            self.setError(.clipboard_failed);
+            return;
+        };
+        self.clearError();
+        self.touchActivity();
+    }
+
+    pub fn collectListingUrls(self: *const AppController, out: [][]const u8) error{TooMany}!usize {
+        const parent = self.listingCollectionId() orelse return 0;
+        var count: usize = 0;
+        try collectUrlsUnderParent(&self.store, parent, out, &count);
+        return count;
+    }
+
+    fn launchUrls(self: *AppController, urls: []const []const u8, incognito: bool) void {
+        if (urls.len == 0) {
+            self.setError(.no_links);
+            return;
+        }
+        var exe_buf: [512]u8 = undefined;
+        const exe = resolveBrowserBinary(self.io, self.allocator, &exe_buf);
+        if (incognito) {
+            if (exe) |path| {
+                if (!chromiumLikeBinary(path)) {
+                    self.setError(.incognito_unsupported);
+                    return;
+                }
+            } else {
+                self.setError(.incognito_unsupported);
+                return;
+            }
+        }
+        if (exe) |path| {
+            if (chromiumLikeBinary(path)) {
+                var argv_buf: [max_open_urls_pub + 2][]const u8 = undefined;
+                const argc = fillChromiumOpenArgv(&argv_buf, path, incognito, urls);
+                spawnArgvWait(self.io, argv_buf[0..argc]) catch {
+                    self.setError(.io_failed);
+                    return;
+                };
+                self.clearError();
+                return;
+            }
+        }
+        if (incognito) {
+            self.setError(.incognito_unsupported);
+            return;
+        }
+        for (urls) |url| {
+            openUrlExternal(self.io, url) catch {
+                self.setError(.io_failed);
+                return;
+            };
+        }
+        self.clearError();
     }
 
     pub fn cutSelectedNode(self: *AppController) void {
@@ -1484,6 +1593,10 @@ pub const AppController = struct {
             .lockout => "Too many attempts — try again in 5 minutes",
             .senhas_weak => "Passwords gate needs uppercase, lowercase, digit, and special",
             .senhas_wrong => "Wrong gate password",
+            .too_many_urls => "Too many links to open or copy at once (max 128)",
+            .no_links => "No links in this folder",
+            .incognito_unsupported => "Incognito needs Thorium, Chrome, or Chromium as the default browser",
+            .clipboard_failed => "Could not copy to the clipboard",
         };
     }
 
@@ -1494,6 +1607,222 @@ pub const AppController = struct {
 
 pub fn uuidKey(id: domain.Uuid) u64 {
     return std.mem.readInt(u64, id[0..8], .little);
+}
+
+pub fn chromiumLikeBinary(path: []const u8) bool {
+    const name = binaryBasename(path);
+    const needles = [_][]const u8{
+        "thorium",
+        "chromium",
+        "chrome",
+        "brave",
+        "vivaldi",
+        "microsoft-edge",
+        "msedge",
+    };
+    for (needles) |needle| {
+        if (std.ascii.indexOfIgnoreCase(name, needle) != null) return true;
+    }
+    return false;
+}
+
+pub fn parseDesktopExecBinary(exec_value: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, exec_value, " \t");
+    var after_env = false;
+    while (it.next()) |tok| {
+        if (tok.len == 0) continue;
+        if (tok[0] == '%') continue;
+        if (std.mem.eql(u8, tok, "env")) {
+            after_env = true;
+            continue;
+        }
+        if (after_env and std.mem.indexOfScalar(u8, tok, '=') != null) continue;
+        after_env = false;
+        if (tok[0] == '-') continue;
+        return tok;
+    }
+    return null;
+}
+
+pub fn fillChromiumOpenArgv(
+    argv: [][]const u8,
+    exe: []const u8,
+    incognito: bool,
+    urls: []const []const u8,
+) usize {
+    var n: usize = 0;
+    argv[n] = exe;
+    n += 1;
+    if (incognito) {
+        argv[n] = "--incognito";
+        n += 1;
+    }
+    for (urls) |url| {
+        argv[n] = url;
+        n += 1;
+    }
+    return n;
+}
+
+fn binaryBasename(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[i + 1 ..];
+    return path;
+}
+
+fn collectUrlsUnderParent(
+    store: *const domain.Store,
+    parent_id: domain.Uuid,
+    out: [][]const u8,
+    count: *usize,
+) error{TooMany}!void {
+    for (store.nodes.items) |node| {
+        switch (node) {
+            .entry => |e| {
+                if (!std.mem.eql(u8, &e.parent_id, &parent_id)) continue;
+                if (e.url.len == 0) continue;
+                if (count.* >= out.len) return error.TooMany;
+                out[count.*] = e.url;
+                count.* += 1;
+            },
+            .collection => |c| {
+                if (!std.mem.eql(u8, &c.parent_id, &parent_id)) continue;
+                try collectUrlsUnderParent(store, c.id, out, count);
+            },
+        }
+    }
+}
+
+fn joinUrlLines(urls: []const []const u8, buf: []u8) error{TooMany}![]const u8 {
+    var n: usize = 0;
+    for (urls, 0..) |url, i| {
+        if (i > 0) {
+            if (n >= buf.len) return error.TooMany;
+            buf[n] = '\n';
+            n += 1;
+        }
+        if (n + url.len > buf.len) return error.TooMany;
+        @memcpy(buf[n .. n + url.len], url);
+        n += url.len;
+    }
+    return buf[0..n];
+}
+
+fn spawnArgvWait(io: std.Io, argv: []const []const u8) CopyError!void {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.IoFailed;
+    _ = child.wait(io) catch return error.IoFailed;
+}
+
+fn copyTextExternal(io: std.Io, text: []const u8) CopyError!void {
+    {
+        const argv = [_][]const u8{ "wl-copy", "--", text };
+        if (spawnArgvWait(io, &argv)) |_| return else |_| {}
+    }
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "xclip", "-selection", "clipboard" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.IoFailed;
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeStreamingAll(io, text) catch {
+            stdin_file.close(io);
+            child.stdin = null;
+            _ = child.wait(io) catch {};
+            return error.IoFailed;
+        };
+        stdin_file.close(io);
+        child.stdin = null;
+    } else {
+        _ = child.wait(io) catch {};
+        return error.IoFailed;
+    }
+    const term = child.wait(io) catch return error.IoFailed;
+    switch (term) {
+        .exited => |code| if (code != 0) return error.IoFailed,
+        else => return error.IoFailed,
+    }
+}
+
+fn resolveBrowserBinary(io: std.Io, allocator: std.mem.Allocator, out: []u8) ?[]const u8 {
+    var desktop_buf: [256]u8 = undefined;
+    if (runCapture(io, &.{ "xdg-settings", "get", "default-web-browser" }, &desktop_buf)) |desktop_name| {
+        var path_buf: [512]u8 = undefined;
+        if (findDesktopFile(io, desktop_name, &path_buf)) |desktop_path| {
+            if (execFromDesktopFile(io, allocator, desktop_path, out)) |exe| return exe;
+        }
+    }
+    const candidates = [_][]const u8{
+        "/usr/bin/thorium-browser",
+        "/usr/bin/thorium",
+        "/usr/local/bin/thorium-browser",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+    };
+    for (candidates) |path| {
+        if (!fileExists(io, path)) continue;
+        if (path.len > out.len) continue;
+        @memcpy(out[0..path.len], path);
+        return out[0..path.len];
+    }
+    return null;
+}
+
+fn findDesktopFile(io: std.Io, name: []const u8, out: []u8) ?[]const u8 {
+    const dirs = [_][]const u8{
+        "/usr/share/applications/",
+        "/usr/local/share/applications/",
+    };
+    for (dirs) |dir| {
+        const path = std.fmt.bufPrint(out, "{s}{s}", .{ dir, name }) catch continue;
+        if (fileExists(io, path)) return path;
+    }
+    return null;
+}
+
+fn execFromDesktopFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, out: []u8) ?[]const u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8192)) catch return null;
+    defer allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "Exec=")) continue;
+        const bin = parseDesktopExecBinary(line["Exec=".len..]) orelse return null;
+        if (bin.len == 0 or bin.len > out.len) return null;
+        @memcpy(out[0..bin.len], bin);
+        return out[0..bin.len];
+    }
+    return null;
+}
+
+fn runCapture(io: std.Io, argv: []const []const u8, buf: []u8) ?[]const u8 {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return null;
+    var n: usize = 0;
+    if (child.stdout) |stdout_file| {
+        var chunk: [256]u8 = undefined;
+        while (n < buf.len) {
+            const read_slices: [1][]u8 = .{&chunk};
+            const count = stdout_file.readStreaming(io, &read_slices) catch break;
+            if (count == 0) break;
+            const take = @min(count, buf.len - n);
+            @memcpy(buf[n .. n + take], chunk[0..take]);
+            n += take;
+            if (take < count) break;
+        }
+    }
+    _ = child.wait(io) catch {};
+    if (n == 0) return null;
+    return trimAscii(buf[0..n]);
 }
 
 fn nowMs(ctrl: *const AppController) u64 {

@@ -486,3 +486,130 @@ test "entry select keeps listing folder and tree focus; tree arrows move from th
     try std.testing.expectEqualSlices(u8, &second_id, &(ctrl.selected_id orelse return error.TestUnexpectedResult));
     try std.testing.expect(ctrl.hasSelectedCollection());
 }
+
+test "collectListingUrls walks nested folders not only direct children" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    defer ctrl.deinit();
+    ctrl.setPasswordText("test-password-123");
+    ctrl.slots.confirm_password_mode = 1;
+    ctrl.setConfirmText("test-password-123");
+    ctrl.createVault();
+
+    ctrl.addCollection();
+    const host_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    const host_name = "e-hentai.org";
+    @memcpy(ctrl.editor_title[0..host_name.len], host_name);
+    ctrl.editor_title_len = host_name.len;
+    ctrl.saveEditor();
+
+    ctrl.selectNode(host_id);
+    ctrl.addCollection();
+    const unread_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    const unread_name = "mangas nao lidos";
+    @memcpy(ctrl.editor_title[0..unread_name.len], unread_name);
+    ctrl.editor_title_len = unread_name.len;
+    ctrl.saveEditor();
+
+    ctrl.selectNode(host_id);
+    ctrl.addCollection();
+    const read_id = ctrl.selected_id orelse return error.TestUnexpectedResult;
+    const read_name = "mangas lidos";
+    @memcpy(ctrl.editor_title[0..read_name.len], read_name);
+    ctrl.editor_title_len = read_name.len;
+    ctrl.saveEditor();
+
+    ctrl.selectNode(unread_id);
+    ctrl.applyPasteEdit(.{ .insert_text = "https://e-hentai.org/g/1/aaa/\nhttps://e-hentai.org/g/2/bbb/\n" });
+    ctrl.ingestPaste();
+
+    ctrl.selectNode(read_id);
+    ctrl.applyPasteEdit(.{ .insert_text = "https://e-hentai.org/g/3/ccc/\n" });
+    ctrl.ingestPaste();
+
+    ctrl.selectNode(host_id);
+    var urls: [app_controller.max_open_urls_pub][]const u8 = undefined;
+    const host_n = try ctrl.collectListingUrls(&urls);
+    try std.testing.expectEqual(@as(usize, 3), host_n);
+
+    ctrl.selectNode(unread_id);
+    const unread_n = try ctrl.collectListingUrls(&urls);
+    try std.testing.expectEqual(@as(usize, 2), unread_n);
+    try std.testing.expect(std.mem.indexOf(u8, urls[0], "/g/1/") != null or std.mem.indexOf(u8, urls[1], "/g/1/") != null);
+
+    ctrl.selectNode(read_id);
+    const read_n = try ctrl.collectListingUrls(&urls);
+    try std.testing.expectEqual(@as(usize, 1), read_n);
+    try std.testing.expect(std.mem.indexOf(u8, urls[0], "/g/3/") != null);
+}
+
+test "chromium open argv uses incognito and thorium binary" {
+    try std.testing.expect(app_controller.chromiumLikeBinary("/usr/bin/thorium-browser"));
+    try std.testing.expect(app_controller.chromiumLikeBinary("thorium"));
+    try std.testing.expect(!app_controller.chromiumLikeBinary("/usr/bin/firefox"));
+    try std.testing.expectEqualStrings(
+        "/usr/bin/thorium-browser",
+        app_controller.parseDesktopExecBinary("/usr/bin/thorium-browser %U") orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqualStrings(
+        "thorium-browser",
+        app_controller.parseDesktopExecBinary("env FOO=1 thorium-browser --flag %U") orelse return error.TestUnexpectedResult,
+    );
+
+    var argv: [8][]const u8 = undefined;
+    const urls = [_][]const u8{ "https://a.test/1", "https://a.test/2" };
+    const n = app_controller.fillChromiumOpenArgv(&argv, "/usr/bin/thorium-browser", true, &urls);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("/usr/bin/thorium-browser", argv[0]);
+    try std.testing.expectEqualStrings("--incognito", argv[1]);
+    try std.testing.expectEqualStrings("https://a.test/1", argv[2]);
+    try std.testing.expectEqualStrings("https://a.test/2", argv[3]);
+}
+
+test "links pane paints bulk open and copy actions" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vault.kakuriyo", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var ctrl = try app_controller.AppController.init(io, alloc, path);
+    defer ctrl.deinit();
+    ctrl.setPasswordText("test-password-123");
+    ctrl.slots.confirm_password_mode = 1;
+    ctrl.setConfirmText("test-password-123");
+    ctrl.createVault();
+    ctrl.applyPasteEdit(.{ .insert_text = "https://alpha.example/a\nhttps://alpha.example/b\n" });
+    ctrl.ingestPaste();
+    ctrl.slots.phase = @intFromEnum(app_controller.Phase.unlocked);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var ui = AppUi.init(arena_state.allocator());
+    const model = std.mem.zeroes(core.Model);
+    const node = app_view.build(&ui, &model, &ctrl);
+    const tree = try ui.finalize(node);
+    var nodes: [max_widget_nodes]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, geometry.RectF.init(0, 0, 1280, 800), &nodes);
+    var saw_open_all = false;
+    var saw_incognito = false;
+    var saw_copy_all = false;
+    var saw_copy = false;
+    for (layout.nodes) |ln| {
+        if (std.mem.eql(u8, ln.widget.text, "Open all")) saw_open_all = true;
+        if (std.mem.eql(u8, ln.widget.text, "Incognito")) saw_incognito = true;
+        if (std.mem.eql(u8, ln.widget.text, "Copy all")) saw_copy_all = true;
+        if (std.mem.eql(u8, ln.widget.text, "Copy")) saw_copy = true;
+    }
+    try std.testing.expect(saw_open_all);
+    try std.testing.expect(saw_incognito);
+    try std.testing.expect(saw_copy_all);
+    try std.testing.expect(saw_copy);
+}
