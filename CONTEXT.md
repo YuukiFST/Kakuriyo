@@ -48,10 +48,6 @@ _Avoid_: Notes (as the field name in domain), markdown document; Password field 
 The visual card (title/image/metadata) shown for an Entry that has a URL.
 _Avoid_: thumbnail-only, embed, iframe
 
-**Screen Block-out**:
-On niri, the Kakuriyo window is replaced by a black rectangle in xdg-desktop-portal screencasts (Discord/OBS) while remaining visible on the physical monitor. Not available on i3/X11.
-_Avoid_: ExcludeFromCapture (Windows), sudo-hide, panic hide as the primary Linux stream guarantee
-
 **Export**:
 Writing a portable encrypted copy of the Vault file (`.kakuriyo`) for manual transfer between machines; not sync.
 _Avoid_: sync, cloud backup, age export (v1)
